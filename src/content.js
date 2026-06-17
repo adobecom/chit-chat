@@ -276,8 +276,9 @@ if (window.__chitChatLoaded) {
     const dot = document.createElement('div');
     const statusClass = `cc-dot--${thread.status ?? 'open'}`;
     dot.className = `cc-dot ${statusClass}`;
-    dot.style.left = `${rect.left + rect.width / 2 + window.scrollX}px`;
-    dot.style.top = `${rect.top + window.scrollY}px`;
+    // Overlay is position:fixed — use viewport coords directly (no scroll offset).
+    dot.style.left = `${rect.left + rect.width / 2}px`;
+    dot.style.top = `${rect.top}px`;
     dot.dataset.threadId = thread.id;
     dot.title = thread.title ?? '';
     dot.addEventListener('click', () => toPanel('cc:panel:dotClicked', { threadId: thread.id }));
@@ -288,8 +289,10 @@ if (window.__chitChatLoaded) {
     const a = thread.anchor;
     const shape = document.createElement('div');
     shape.className = `cc-shape${a.shape === 'ellipse' ? ' cc-shape--ellipse' : ''}${thread.status === 'closed' ? ' cc-shape--closed' : thread.status === 'approved' ? ' cc-shape--approved' : ''}`;
-    shape.style.left = `${a.x}px`;
-    shape.style.top = `${a.y}px`;
+    // Shape anchors are stored as page (document) coordinates. Overlay is
+    // position:fixed, so subtract scroll to convert to viewport coordinates.
+    shape.style.left = `${a.x - window.scrollX}px`;
+    shape.style.top = `${a.y - window.scrollY}px`;
     shape.style.width = `${a.width}px`;
     shape.style.height = `${a.height}px`;
     shape.dataset.threadId = thread.id;
@@ -297,7 +300,8 @@ if (window.__chitChatLoaded) {
     overlay.appendChild(shape);
   }
 
-  // Reposition dot markers on scroll/resize (shapes use absolute page coords, skip)
+  // Reposition all markers on scroll/resize.
+  // Dots track their element's viewport position; shapes re-convert page→viewport.
   function repositionMarkers() {
     const overlay = document.getElementById('cc-overlay');
     if (!overlay) return;
@@ -306,8 +310,16 @@ if (window.__chitChatLoaded) {
       const res = _resolvedMap[tid];
       if (!res?.element) continue;
       const rect = res.element.getBoundingClientRect();
-      dot.style.left = `${rect.left + rect.width / 2 + window.scrollX}px`;
-      dot.style.top = `${rect.top + window.scrollY}px`;
+      dot.style.left = `${rect.left + rect.width / 2}px`;
+      dot.style.top = `${rect.top}px`;
+    }
+    for (const shape of overlay.querySelectorAll('.cc-shape')) {
+      const tid = shape.dataset.threadId;
+      const t = _threads.find((x) => x.id === tid);
+      if (!t?.anchor) continue;
+      const a = t.anchor;
+      shape.style.left = `${a.x - window.scrollX}px`;
+      shape.style.top = `${a.y - window.scrollY}px`;
     }
   }
 

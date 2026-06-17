@@ -104,17 +104,26 @@ function App() {
   }, []);
   useEffect(() => { refreshAuth(); }, []);
 
-  // ── Get current tab ───────────────────────────────────────────────────────
+  // ── Get current tab + seed initial URL ───────────────────────────────────
+  // The content script sends cc:panel:pageUrl on boot, but the panel may load
+  // after that message was already sent. Read the tab URL directly so threads
+  // load immediately without waiting for the next content-script event.
   useEffect(() => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs[0]) setTabId(tabs[0].id);
+    function applyTab(tab) {
+      if (!tab) return;
+      setTabId(tab.id);
+      const url = tab.url ? new URL(tab.url) : null;
+      if (url) setPageUrl(url.origin + url.pathname);
+    }
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => applyTab(tabs[0]));
+
+    chrome.tabs.onActivated.addListener(({ tabId: tid }) => {
+      chrome.tabs.get(tid, applyTab);
     });
-    // Also listen for tab activation changes
-    chrome.tabs.onActivated.addListener(({ tabId: tid }) => setTabId(tid));
-    chrome.tabs.onUpdated.addListener((tid, info) => {
+    chrome.tabs.onUpdated.addListener((tid, info, tab) => {
       if (info.status === 'complete') {
         chrome.tabs.query({ active: true, currentWindow: true }, (ts) => {
-          if (ts[0]?.id === tid) setTabId(tid);
+          if (ts[0]?.id === tid) applyTab(ts[0]);
         });
       }
     });

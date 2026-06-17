@@ -46,17 +46,27 @@ async function acquireToken() {
   const promise = new Promise((resolve, reject) => {
     const EXT_ID = chrome.runtime.id;
     const url = `${AUTH_PAGE}?extId=${EXT_ID}`;
-    let authWinId = null;
+
+    // authWinId is set asynchronously; use a Promise so the listener and
+    // timeout always close the correct window even if they fire before the
+    // chrome.windows.create callback returns.
+    let resolveWinId;
+    const winIdPromise = new Promise((r) => { resolveWinId = r; });
 
     chrome.windows.create({ url, type: 'popup', width: 480, height: 360 }, (win) => {
-      authWinId = win?.id ?? null;
+      resolveWinId(win?.id ?? null);
     });
+
+    async function closeAuthWin() {
+      const id = await winIdPromise;
+      if (id !== null) chrome.windows.remove(id).catch(() => {});
+    }
 
     // Timeout after 3 min
     const timeout = setTimeout(() => {
       reject(new Error('auth timeout'));
       pendingAuth.delete('global');
-      if (authWinId !== null) chrome.windows.remove(authWinId).catch(() => {});
+      closeAuthWin();
     }, 180_000);
 
     // Listen for the token message from the relay page
@@ -70,7 +80,7 @@ async function acquireToken() {
       chrome.runtime.onMessageExternal.removeListener(onExtMessage);
       pendingAuth.delete('global');
       sendResponse({ ok: true });
-      if (authWinId !== null) chrome.windows.remove(authWinId).catch(() => {});
+      closeAuthWin();
       resolve(message.access_token);
     }
 

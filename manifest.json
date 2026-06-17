@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Annotation overlay for AEM/DA pages. Toolbar click opens the side panel and injects the overlay.",
 
-  "permissions": ["sidePanel", "activeTab", "scripting", "storage"],
+  "permissions": ["sidePanel", "activeTab", "scripting", "storage", "tabs"],
   "host_permissions": ["https://milo-core-prod.adobe.io/*"],
 
   "externally_connectable": {
