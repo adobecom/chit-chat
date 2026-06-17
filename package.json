@@ -1,0 +1,16 @@
+{
+  "name": "chit-chat",
+  "version": "1.0.0",
+  "description": "Chrome side-panel extension for the Milo page-commenter annotation tool",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "icons": "node scripts/make-icons.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "preact": "^10.25.0"
+  }
+}

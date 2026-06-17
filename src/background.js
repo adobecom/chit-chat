@@ -1,0 +1,256 @@
+/**
+ * background.js — Chit Chat MV3 service worker.
+ *
+ * Responsibilities:
+ *   1. Action click → open side panel + inject content script into the active tab.
+ *   2. IMS auth via the milo-core-prod /ext-auth relay page.
+ *   3. All /annotations network requests (host_permissions bypass CORS here).
+ *   4. Message broker between the side panel and the active tab's content script.
+ */
+
+// ── Constants ──────────────────────────────────────────────────────────────
+
+const API_BASE = 'https://milo-core-prod.adobe.io/annotations';
+const AUTH_PAGE = 'https://milo-core-prod.adobe.io/ext-auth';
+const CLIENT_ID = 'milo-logs-claude-mcp';
+const REQUEST_TIMEOUT_MS = 30_000;
+
+// ── Auth ───────────────────────────────────────────────────────────────────
+
+/** Retrieve the cached IMS token, or null. */
+async function getToken() {
+  const s = await chrome.storage.session.get('imsToken');
+  return s.imsToken ?? null;
+}
+
+/** Store the IMS token. */
+async function setToken(token) {
+  await chrome.storage.session.set({ imsToken: token });
+}
+
+/** Clear the IMS token (e.g. after a 401). */
+async function clearToken() {
+  await chrome.storage.session.remove('imsToken');
+}
+
+// Pending auth promises — keyed by tabId so a second click doesn't open two windows.
+const pendingAuth = new Map();
+
+/**
+ * Open the /ext-auth relay page and wait for the extension message with the token.
+ * Returns the access_token string, or throws on timeout/cancellation.
+ */
+async function acquireToken() {
+  if (pendingAuth.has('global')) return pendingAuth.get('global');
+
+  const promise = new Promise((resolve, reject) => {
+    const EXT_ID = chrome.runtime.id;
+    const url = `${AUTH_PAGE}?extId=${EXT_ID}`;
+    let authWinId = null;
+
+    chrome.windows.create({ url, type: 'popup', width: 480, height: 360 }, (win) => {
+      authWinId = win?.id ?? null;
+    });
+
+    // Timeout after 3 min
+    const timeout = setTimeout(() => {
+      reject(new Error('auth timeout'));
+      pendingAuth.delete('global');
+      if (authWinId !== null) chrome.windows.remove(authWinId).catch(() => {});
+    }, 180_000);
+
+    // Listen for the token message from the relay page
+    function onExtMessage(message, sender, sendResponse) {
+      if (
+        message?.type !== 'pc-ims-token' ||
+        !message.access_token ||
+        sender.origin !== 'https://milo-core-prod.adobe.io'
+      ) return;
+      clearTimeout(timeout);
+      chrome.runtime.onMessageExternal.removeListener(onExtMessage);
+      pendingAuth.delete('global');
+      sendResponse({ ok: true });
+      if (authWinId !== null) chrome.windows.remove(authWinId).catch(() => {});
+      resolve(message.access_token);
+    }
+
+    chrome.runtime.onMessageExternal.addListener(onExtMessage);
+  });
+
+  pendingAuth.set('global', promise);
+  return promise;
+}
+
+/** Get a valid token, prompting sign-in if needed. */
+async function ensureToken() {
+  let token = await getToken();
+  if (!token) {
+    token = await acquireToken();
+    await setToken(token);
+  }
+  return token;
+}
+
+// ── Network helpers ────────────────────────────────────────────────────────
+
+async function apiRequest(path, opts = {}, retry = true) {
+  const token = await ensureToken();
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${API_BASE}${path}${sep}clientId=${CLIENT_ID}`;
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let res;
+  try {
+    res = await fetch(url, {
+      ...opts,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        ...(opts.headers ?? {}),
+      },
+    });
+  } finally {
+    clearTimeout(tid);
+  }
+
+  if (res.status === 401 && retry) {
+    // Token expired — clear and retry once
+    await clearToken();
+    return apiRequest(path, opts, false);
+  }
+
+  if (res.status === 204) return null;
+  if (!res.ok) {
+    let body;
+    try { body = await res.json(); } catch { body = null; }
+    const err = new Error(body?.error ?? `${res.status} ${res.statusText}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+// ── Message handler ────────────────────────────────────────────────────────
+
+/**
+ * Central message dispatcher. Messages arrive from:
+ *   - content.js (via chrome.runtime.sendMessage)
+ *   - sidepanel.js (via chrome.runtime.sendMessage)
+ *
+ * Naming convention:
+ *   cc:api:*        — proxy network request, response is the API result
+ *   cc:auth:signIn  — trigger sign-in flow
+ *   cc:auth:signOut — clear stored token
+ *   cc:auth:status  — report signed-in state + profile
+ *   cc:tab:*        — forward to the content script of the specified tab
+ *   cc:panel:*      — forward to the side panel (via content→SW→panel routing)
+ */
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  handleMessage(msg, sender)
+    .then((result) => sendResponse({ ok: true, result }))
+    .catch((err) => sendResponse({ ok: false, error: err.message }));
+  return true; // keep channel open for async response
+});
+
+async function handleMessage(msg, sender) {
+  const { type } = msg;
+
+  // ── API proxy ───────────────────────────────────────────────────────────
+  if (type === 'cc:api:fetchThreads') {
+    return apiRequest(`/threads?page_url=${encodeURIComponent(msg.pageUrl)}`);
+  }
+  if (type === 'cc:api:createThread') {
+    return apiRequest('/threads', {
+      method: 'POST',
+      body: JSON.stringify({ page_url: msg.pageUrl, anchor: msg.anchor }),
+    });
+  }
+  if (type === 'cc:api:patchThread') {
+    return apiRequest(`/threads/${msg.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(msg.data),
+    });
+  }
+  if (type === 'cc:api:deleteThread') {
+    return apiRequest(`/threads/${msg.id}`, { method: 'DELETE' });
+  }
+  if (type === 'cc:api:createComment') {
+    return apiRequest('/comments', {
+      method: 'POST',
+      body: JSON.stringify({ thread_id: msg.threadId, body: msg.body }),
+    });
+  }
+  if (type === 'cc:api:patchComment') {
+    return apiRequest(`/comments/${msg.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ body: msg.body }),
+    });
+  }
+  if (type === 'cc:api:deleteComment') {
+    return apiRequest(`/comments/${msg.id}`, { method: 'DELETE' });
+  }
+  if (type === 'cc:api:voteComment') {
+    return apiRequest(`/comments/${msg.id}/vote`, {
+      method: 'POST',
+      body: JSON.stringify({ upvoteDelta: msg.upvoteDelta ?? 0, downvoteDelta: msg.downvoteDelta ?? 0 }),
+    });
+  }
+
+  // ── Auth ────────────────────────────────────────────────────────────────
+  if (type === 'cc:auth:signIn') {
+    const token = await acquireToken();
+    await setToken(token);
+    return { signedIn: true };
+  }
+  if (type === 'cc:auth:signOut') {
+    await clearToken();
+    return { signedIn: false };
+  }
+  if (type === 'cc:auth:status') {
+    const token = await getToken();
+    return { signedIn: !!token };
+  }
+
+  // ── Forward from panel → content script of a tab ──────────────────────
+  // The side panel passes msg.tabId for routing.
+  if (type === 'cc:tab:forward') {
+    return chrome.tabs.sendMessage(msg.tabId, msg.payload);
+  }
+
+  // ── Forward from content → side panel (broadcast to extension pages) ──
+  // Used for: page URL changed, anchor re-resolution results.
+  if (type === 'cc:panel:forward') {
+    // Side panel listens for chrome.runtime.onMessage so it receives this too.
+    // Just return — the panel already picked it up through the onMessage listener
+    // (service worker can't directly target the side panel, but it arrives there
+    // because onMessage fires in all extension contexts including the side panel).
+    return null;
+  }
+
+  throw new Error(`unknown message type: ${type}`);
+}
+
+// ── Action click ───────────────────────────────────────────────────────────
+
+chrome.action.onClicked.addListener(async (tab) => {
+  if (!tab?.id) return;
+
+  // Open the native side panel for this tab
+  await chrome.sidePanel.open({ tabId: tab.id });
+
+  // Inject the content script if it isn't already running.
+  // executeScript throws on chrome://, about:, or extension pages — swallow those.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['dist/content.js'],
+      world: 'MAIN', // needs page-world access (getBoundingClientRect, etc.)
+    });
+  } catch (err) {
+    // Not injectable (chrome:// page, etc.) — side panel still opens, content features
+    // will be unavailable. Log to service-worker console only.
+    console.warn('[chit-chat] could not inject content script:', err.message);
+  }
+});
