@@ -188,16 +188,15 @@ if (window.__chitChatLoaded) {
       .cc-dot:hover { transform: translate(-50%,-50%) scale(1.2); }
       /* Status ring colors (background is now per-user, set inline) */
       .cc-dot--open        { border-color: #0265DC; }
+      .cc-dot--in_progress { border-color: #E68619; }
       .cc-dot--resolved    { border-color: #2D9D78; }
       .cc-dot--approximate { border-color: #E68619; }
-      .cc-dot--closed      { border-color: #6D6D6D; }
-      .cc-dot--approved    { border-color: #2D9D78; }
       .cc-shape { position: absolute; pointer-events: all; cursor: pointer;
                   border: 2px solid #0265DC; background: rgba(2,101,220,.08);
                   box-sizing: border-box; }
       .cc-shape--ellipse { border-radius: 50%; }
-      .cc-shape--closed  { border-color: #6D6D6D; background: rgba(109,109,109,.08); }
-      .cc-shape--approved{ border-color: #2D9D78; background: rgba(45,157,120,.08); }
+      .cc-shape--in_progress { border-color: #E68619; background: rgba(230,134,25,.08); }
+      .cc-shape--resolved    { border-color: #2D9D78; background: rgba(45,157,120,.08); }
       /* element-picker highlight overlay */
       #cc-element-picker { position: fixed; inset: 0; z-index: 2147483641;
                            pointer-events: none; }
@@ -326,7 +325,7 @@ if (window.__chitChatLoaded) {
     dot.title = thread.title ?? '';
 
     // Per-user color as background; status drives the ring (border-color via CSS class).
-    const author = thread.comments?.[0]?.author ?? '';
+    const author = thread.comments?.[0]?.author_name ?? '';
     dot.style.background = colorForUser(author);
 
     // Show the author's first initial inside the dot (mirrors milo DotMarker.js).
@@ -339,7 +338,9 @@ if (window.__chitChatLoaded) {
   function renderShapeMarker(overlay, thread) {
     const a = thread.anchor;
     const shape = document.createElement('div');
-    shape.className = `cc-shape${a.shape === 'ellipse' ? ' cc-shape--ellipse' : ''}${thread.status === 'closed' ? ' cc-shape--closed' : thread.status === 'approved' ? ' cc-shape--approved' : ''}`;
+    const statusMod = (thread.status === 'in_progress' || thread.status === 'resolved')
+      ? ` cc-shape--${thread.status}` : '';
+    shape.className = `cc-shape${a.shape === 'ellipse' ? ' cc-shape--ellipse' : ''}${statusMod}`;
     // Shape anchors are stored as page (document) coordinates. Overlay is
     // position:fixed, so subtract scroll to convert to viewport coordinates.
     shape.style.left = `${a.x - window.scrollX}px`;

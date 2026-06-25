@@ -246,6 +246,12 @@ html, body {
   opacity: 0.6;
 }
 
+.cc-comment-edited {
+  font-size: 11px;
+  opacity: 0.5;
+  font-style: italic;
+}
+
 .cc-comment-body {
   font-size: 14px;
   margin: 0 0 8px;

@@ -56,24 +56,26 @@ async function getProfile() {
 }
 
 /**
- * Fetch the user profile from the IMS profile endpoint.
+ * Fetch the user profile from the OIDC userinfo endpoint.
  * Returns { name, email, avatar } or null.
- * Uses /ims/profile/v1 (mirrors milo-logs-deploy ims.js) which returns
- * displayName / first_name / last_name and an avatar URL.
+ * Uses /ims/userinfo/v2 (requires client_id param; matches openid/profile/email scopes).
+ * Field names follow OIDC conventions: name / given_name+family_name / preferred_username / email.
  */
 async function fetchUserProfile(token) {
   try {
-    const res = await fetch(`${IMS_ORIGIN}/ims/profile/v1`, {
+    const res = await fetch(`${IMS_ORIGIN}/ims/userinfo/v2?client_id=${CLIENT_ID}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
     const d = await res.json();
-    const name = d.displayName
-      || `${d.first_name || ''} ${d.last_name || ''}`.trim()
+    const name = d.name
+      || `${d.given_name || ''} ${d.family_name || ''}`.trim()
+      || d.displayName
+      || d.preferred_username
       || d.email
       || null;
     if (!name && !d.email) return null;
-    return { name, email: d.email ?? null, avatar: d.avatar ?? null };
+    return { name, email: d.email ?? null, avatar: d.account?.avatar ?? d.avatar ?? null };
   } catch { return null; }
 }
 
