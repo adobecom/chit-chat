@@ -28,7 +28,7 @@ const HOSTS = {
 const API_BASE   = HOSTS[ENV].api;
 const IMS_ORIGIN = HOSTS[ENV].ims;
 const CLIENT_ID  = 'milo-logs-claude-mcp';
-const SCOPES     = 'AdobeID,openid,profile,email';
+const SCOPES     = 'AdobeID,email,openid';
 const REQUEST_TIMEOUT_MS = 30_000;
 
 // ── Auth ───────────────────────────────────────────────────────────────────
@@ -102,9 +102,23 @@ async function acquireToken() {
 
       if (!redirectUrl) throw new Error('Sign-in cancelled');
 
-      // Token lives in the URL fragment: …#access_token=xxx&expires_in=yyy&…
+      // IMS may put errors in the query string (e.g. ?error=redirect_uri_mismatch)
+      // rather than the fragment in some failure modes.
+      const qIdx = redirectUrl.indexOf('?');
       const hashIdx = redirectUrl.indexOf('#');
-      if (hashIdx === -1) throw new Error('No fragment in redirect URL');
+      if (hashIdx === -1) {
+        if (qIdx !== -1) {
+          const query = new URLSearchParams(redirectUrl.slice(qIdx + 1));
+          const qError = query.get('error');
+          if (qError) {
+            const desc = query.get('error_description') ?? 'no description';
+            throw new Error(`IMS auth error: ${qError} — ${desc}`);
+          }
+        }
+        throw new Error(`No fragment in redirect URL — check SW console for the full redirect URL`);
+      }
+
+      // Token lives in the URL fragment: …#access_token=xxx&expires_in=yyy&…
       const fragment = new URLSearchParams(redirectUrl.slice(hashIdx + 1));
       const imsError = fragment.get('error');
       if (imsError) {
