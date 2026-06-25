@@ -12,7 +12,7 @@
  *   view       — 'list' | 'detail'
  *   activeId   — focused thread id (detail view)
  *   mode       — annotation mode: null|'element'|'rect'|'ellipse'
- *   auth       — { signedIn: bool, profile: { email, name }|null }
+ *   auth       — { signedIn: bool, profile: { email, name, avatar }|null }
  *   theme      — 'light'|'dark'
  */
 
@@ -302,9 +302,9 @@ function App() {
       <div className="cc-topbar">
         {auth.signedIn ? (
           <>
-            <div className="cc-avatar">
-              {initials(auth.profile?.name, auth.profile?.email)}
-            </div>
+            {auth.profile?.avatar
+              ? <img className="cc-avatar cc-avatar--img" src={auth.profile.avatar} alt="" />
+              : <div className="cc-avatar">{initials(auth.profile?.name, auth.profile?.email)}</div>}
             <span className="cc-identity-name">
               {auth.profile?.name ?? auth.profile?.email ?? 'Signed in'}
             </span>

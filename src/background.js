@@ -55,18 +55,25 @@ async function getProfile() {
   return s.imsProfile ?? null;
 }
 
-/** Fetch the user profile from the IMS userinfo endpoint. Returns { name, email } or null. */
+/**
+ * Fetch the user profile from the IMS profile endpoint.
+ * Returns { name, email, avatar } or null.
+ * Uses /ims/profile/v1 (mirrors milo-logs-deploy ims.js) which returns
+ * displayName / first_name / last_name and an avatar URL.
+ */
 async function fetchUserProfile(token) {
   try {
-    const res = await fetch(`${IMS_ORIGIN}/ims/userinfo/v2`, {
+    const res = await fetch(`${IMS_ORIGIN}/ims/profile/v1`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
-    const data = await res.json();
-    return {
-      name: data.name ?? data.given_name ?? null,
-      email: data.email ?? null,
-    };
+    const d = await res.json();
+    const name = d.displayName
+      || `${d.first_name || ''} ${d.last_name || ''}`.trim()
+      || d.email
+      || null;
+    if (!name && !d.email) return null;
+    return { name, email: d.email ?? null, avatar: d.avatar ?? null };
   } catch { return null; }
 }
 

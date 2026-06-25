@@ -63,6 +63,11 @@ html, body {
   flex-shrink: 0;
 }
 
+.cc-avatar--img {
+  object-fit: cover;
+  /* inherits width/height/border-radius/flex-shrink from .cc-avatar */
+}
+
 .cc-identity-name {
   flex: 1;
   font-size: 13px;
