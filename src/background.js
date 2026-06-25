@@ -3,16 +3,31 @@
  *
  * Responsibilities:
  *   1. Action click → open side panel + inject content script into the active tab.
- *   2. IMS auth via the milo-core-prod /ext-auth relay page.
+ *   2. IMS auth via the milo-core /ext-auth relay page + chrome.runtime.onMessageExternal.
  *   3. All /annotations network requests (host_permissions bypass CORS here).
  *   4. Message broker between the side panel and the active tab's content script.
  */
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-const API_BASE = 'https://milo-core-prod.adobe.io/annotations';
-const AUTH_PAGE = 'https://milo-core-prod.adobe.io/ext-auth';
-const CLIENT_ID = 'milo-logs-claude-mcp';
+// Toggle 'stage' ↔ 'prod' to switch both the relay page and API together.
+const ENV = 'stage'; // 'stage' | 'prod'
+const HOSTS = {
+  stage: {
+    server: 'https://milo-core-stage.adobe.io',
+    api: 'https://milo-core-stage.adobe.io/annotations',
+    ims: 'https://ims-na1-stg1.adobelogin.com',
+  },
+  prod: {
+    server: 'https://milo-core-prod.adobe.io',
+    api: 'https://milo-core-prod.adobe.io/annotations',
+    ims: 'https://ims-na1.adobelogin.com',
+  },
+};
+const API_BASE   = HOSTS[ENV].api;
+const AUTH_PAGE  = `${HOSTS[ENV].server}/ext-auth`;
+const IMS_ORIGIN = HOSTS[ENV].ims;
+const CLIENT_ID  = 'milo-logs-claude-mcp';
 const REQUEST_TIMEOUT_MS = 30_000;
 
 // ── Auth ───────────────────────────────────────────────────────────────────
@@ -33,62 +48,87 @@ async function clearToken() {
   await chrome.storage.session.remove('imsToken');
 }
 
-// Pending auth promises — keyed by tabId so a second click doesn't open two windows.
-const pendingAuth = new Map();
+/** Retrieve the cached IMS profile, or null. */
+async function getProfile() {
+  const s = await chrome.storage.session.get('imsProfile');
+  return s.imsProfile ?? null;
+}
+
+/** Fetch the user profile from the IMS userinfo endpoint. Returns { name, email } or null. */
+async function fetchUserProfile(token) {
+  try {
+    const res = await fetch(`${IMS_ORIGIN}/ims/userinfo/v2`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return {
+      name: data.name ?? data.given_name ?? null,
+      email: data.email ?? null,
+    };
+  } catch { return null; }
+}
+
+// Deduplicates concurrent sign-in requests so a double-click doesn't open two popups.
+let pendingAuthPromise = null;
 
 /**
- * Open the /ext-auth relay page and wait for the extension message with the token.
- * Returns the access_token string, or throws on timeout/cancellation.
+ * Open the /ext-auth relay page in a popup and wait for the token message.
+ *
+ * The relay page runs imslib, completes the IMS sign-in flow, then calls:
+ *   chrome.runtime.sendMessage(extId, { type: 'pc-ims-token', access_token })
+ * The service worker receives that via onMessageExternal, validates the sender
+ * origin, and resolves the promise with the raw access token.
  */
 async function acquireToken() {
-  if (pendingAuth.has('global')) return pendingAuth.get('global');
+  if (pendingAuthPromise) return pendingAuthPromise;
 
-  const promise = new Promise((resolve, reject) => {
-    const EXT_ID = chrome.runtime.id;
-    const url = `${AUTH_PAGE}?extId=${EXT_ID}`;
+  pendingAuthPromise = (async () => {
+    try {
+      return await new Promise((resolve, reject) => {
+        const url = `${AUTH_PAGE}?extId=${chrome.runtime.id}`;
 
-    // authWinId is set asynchronously; use a Promise so the listener and
-    // timeout always close the correct window even if they fire before the
-    // chrome.windows.create callback returns.
-    let resolveWinId;
-    const winIdPromise = new Promise((r) => { resolveWinId = r; });
+        // Window id is set asynchronously; use a promise so the listener and
+        // timeout can close it reliably even if they fire before the callback.
+        let resolveWinId;
+        const winIdPromise = new Promise(r => { resolveWinId = r; });
+        chrome.windows.create({ url, type: 'popup', width: 480, height: 360 }, win => {
+          resolveWinId(win?.id ?? null);
+        });
 
-    chrome.windows.create({ url, type: 'popup', width: 480, height: 360 }, (win) => {
-      resolveWinId(win?.id ?? null);
-    });
+        async function closeAuthWin() {
+          const id = await winIdPromise;
+          if (id !== null) chrome.windows.remove(id).catch(() => {});
+        }
 
-    async function closeAuthWin() {
-      const id = await winIdPromise;
-      if (id !== null) chrome.windows.remove(id).catch(() => {});
+        const timeout = setTimeout(() => {
+          chrome.runtime.onMessageExternal.removeListener(onExtMessage);
+          pendingAuthPromise = null;
+          reject(new Error('Sign-in timed out'));
+          closeAuthWin();
+        }, 180_000);
+
+        function onExtMessage(message, sender, sendResponse) {
+          if (
+            message?.type !== 'pc-ims-token' ||
+            !message.access_token ||
+            sender.origin !== HOSTS[ENV].server
+          ) return;
+          clearTimeout(timeout);
+          chrome.runtime.onMessageExternal.removeListener(onExtMessage);
+          sendResponse({ ok: true });
+          closeAuthWin();
+          resolve(message.access_token);
+        }
+
+        chrome.runtime.onMessageExternal.addListener(onExtMessage);
+      });
+    } finally {
+      pendingAuthPromise = null;
     }
+  })();
 
-    // Timeout after 3 min
-    const timeout = setTimeout(() => {
-      reject(new Error('auth timeout'));
-      pendingAuth.delete('global');
-      closeAuthWin();
-    }, 180_000);
-
-    // Listen for the token message from the relay page
-    function onExtMessage(message, sender, sendResponse) {
-      if (
-        message?.type !== 'pc-ims-token' ||
-        !message.access_token ||
-        sender.origin !== 'https://milo-core-prod.adobe.io'
-      ) return;
-      clearTimeout(timeout);
-      chrome.runtime.onMessageExternal.removeListener(onExtMessage);
-      pendingAuth.delete('global');
-      sendResponse({ ok: true });
-      closeAuthWin();
-      resolve(message.access_token);
-    }
-
-    chrome.runtime.onMessageExternal.addListener(onExtMessage);
-  });
-
-  pendingAuth.set('global', promise);
-  return promise;
+  return pendingAuthPromise;
 }
 
 /** Get a valid token, prompting sign-in if needed. */
@@ -212,15 +252,18 @@ async function handleMessage(msg, sender) {
   if (type === 'cc:auth:signIn') {
     const token = await acquireToken();
     await setToken(token);
+    const profile = await fetchUserProfile(token);
+    await chrome.storage.session.set({ imsProfile: profile });
     return { signedIn: true };
   }
   if (type === 'cc:auth:signOut') {
-    await clearToken();
+    await chrome.storage.session.remove(['imsToken', 'imsProfile']);
     return { signedIn: false };
   }
   if (type === 'cc:auth:status') {
     const token = await getToken();
-    return { signedIn: !!token };
+    if (!token) return { signedIn: false };
+    return { signedIn: true, profile: await getProfile() };
   }
 
   // ── Forward from panel → content script of a tab ──────────────────────

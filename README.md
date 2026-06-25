@@ -27,16 +27,17 @@ For live development: `npm run watch` rebuilds on every change.
 
 The overlay and API both work on **any page** — the extension uses `host_permissions` for `milo-core-prod.adobe.io` so API fetches bypass CORS entirely (unlike the bookmarklet, which is gated to CORS-allowlisted origins). However, the page's Content-Security-Policy may still block the content script from running on some pages.
 
-## Auth relay handshake
+## Auth handshake
 
-Sign-in opens a popup at `https://milo-core-prod.adobe.io/ext-auth?extId=<ext-id>`. That page:
-1. Loads Adobe imslib for client `milo-logs-claude-mcp`
-2. Starts the IMS sign-in flow (picks up an existing session or opens a modal)
-3. On token receipt, calls `chrome.runtime.sendMessage(extId, { type: 'pc-ims-token', access_token })`
+Sign-in uses `chrome.identity.launchWebAuthFlow` — no relay page required. The flow:
+1. The service worker builds an IMS implicit-grant authorize URL (`response_type=token`) for client `milo-logs-claude-mcp`.
+2. Chrome opens the IMS login UI. On success, IMS redirects to `https://<ext-id>.chromiumapp.org/#access_token=...`.
+3. Chrome intercepts the redirect and returns the URL to the service worker, which parses the token from the hash.
+4. The token is stored in `chrome.storage.session`.
 
-The extension service worker receives the token via `chrome.runtime.onMessageExternal`, validates `sender.origin === 'https://milo-core-prod.adobe.io'`, stores it in `chrome.storage.session`, and closes the popup.
+**Setup:** the redirect URI `https://<ext-id>.chromiumapp.org/` must be registered on the IMS client. The extension ID is stable because the manifest includes a `key`. To find the exact redirect URI, open the service worker console and run `chrome.identity.getRedirectURL()`.
 
-The token is a raw Adobe IMS access token for client `milo-logs-claude-mcp`, same as the bookmarklet uses.
+**Environment (`ENV` constant in `background.js`):** `'stage'` points at `ims-na1-stg1.adobelogin.com` + `milo-core-stage.adobe.io`; `'prod'` points at the production IMS and API. Keep them in sync — a stage token is rejected by the prod API.
 
 ## Anchor format compatibility
 
