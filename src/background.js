@@ -3,31 +3,32 @@
  *
  * Responsibilities:
  *   1. Action click → open side panel + inject content script into the active tab.
- *   2. IMS auth via the milo-core /ext-auth relay page + chrome.runtime.onMessageExternal.
+ *   2. IMS auth via chrome.identity.launchWebAuthFlow (implicit grant, response_type=token).
+ *      The manifest "key" pins the extension ID to nafgnogpgkcheonjkjjdfjjhnhllbkdh so
+ *      the chromiumapp.org redirect URI stays stable. Currently registered for stage IMS
+ *      only; prod requires the same redirect URI to be registered with Adobe IMS first.
  *   3. All /annotations network requests (host_permissions bypass CORS here).
  *   4. Message broker between the side panel and the active tab's content script.
  */
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-// Toggle 'stage' ↔ 'prod' to switch both the relay page and API together.
+// Toggle 'stage' ↔ 'prod' to switch both the IMS host and API together.
 const ENV = 'stage'; // 'stage' | 'prod'
 const HOSTS = {
   stage: {
-    server: 'https://milo-core-stage.adobe.io',
     api: 'https://milo-core-stage.adobe.io/annotations',
     ims: 'https://ims-na1-stg1.adobelogin.com',
   },
   prod: {
-    server: 'https://milo-core-prod.adobe.io',
     api: 'https://milo-core-prod.adobe.io/annotations',
     ims: 'https://ims-na1.adobelogin.com',
   },
 };
 const API_BASE   = HOSTS[ENV].api;
-const AUTH_PAGE  = `${HOSTS[ENV].server}/ext-auth`;
 const IMS_ORIGIN = HOSTS[ENV].ims;
 const CLIENT_ID  = 'milo-logs-claude-mcp';
+const SCOPES     = 'AdobeID,openid,profile,email';
 const REQUEST_TIMEOUT_MS = 30_000;
 
 // ── Auth ───────────────────────────────────────────────────────────────────
@@ -73,56 +74,47 @@ async function fetchUserProfile(token) {
 let pendingAuthPromise = null;
 
 /**
- * Open the /ext-auth relay page in a popup and wait for the token message.
+ * Launch the Adobe IMS authorize page via chrome.identity.launchWebAuthFlow
+ * (implicit grant, response_type=token) and extract the access_token from the
+ * redirect URL fragment that Chrome intercepts.
  *
- * The relay page runs imslib, completes the IMS sign-in flow, then calls:
- *   chrome.runtime.sendMessage(extId, { type: 'pc-ims-token', access_token })
- * The service worker receives that via onMessageExternal, validates the sender
- * origin, and resolves the promise with the raw access token.
+ * The manifest "key" stabilises the extension ID so the registered
+ * chromiumapp.org redirect URI never changes across reloads.
  */
 async function acquireToken() {
   if (pendingAuthPromise) return pendingAuthPromise;
 
   pendingAuthPromise = (async () => {
     try {
-      return await new Promise((resolve, reject) => {
-        const url = `${AUTH_PAGE}?extId=${chrome.runtime.id}`;
-
-        // Window id is set asynchronously; use a promise so the listener and
-        // timeout can close it reliably even if they fire before the callback.
-        let resolveWinId;
-        const winIdPromise = new Promise(r => { resolveWinId = r; });
-        chrome.windows.create({ url, type: 'popup', width: 480, height: 360 }, win => {
-          resolveWinId(win?.id ?? null);
-        });
-
-        async function closeAuthWin() {
-          const id = await winIdPromise;
-          if (id !== null) chrome.windows.remove(id).catch(() => {});
-        }
-
-        const timeout = setTimeout(() => {
-          chrome.runtime.onMessageExternal.removeListener(onExtMessage);
-          pendingAuthPromise = null;
-          reject(new Error('Sign-in timed out'));
-          closeAuthWin();
-        }, 180_000);
-
-        function onExtMessage(message, sender, sendResponse) {
-          if (
-            message?.type !== 'pc-ims-token' ||
-            !message.access_token ||
-            sender.origin !== HOSTS[ENV].server
-          ) return;
-          clearTimeout(timeout);
-          chrome.runtime.onMessageExternal.removeListener(onExtMessage);
-          sendResponse({ ok: true });
-          closeAuthWin();
-          resolve(message.access_token);
-        }
-
-        chrome.runtime.onMessageExternal.addListener(onExtMessage);
+      const redirectUri = chrome.identity.getRedirectURL();
+      const params = new URLSearchParams({
+        client_id: CLIENT_ID,
+        scope: SCOPES,
+        response_type: 'token',
+        redirect_uri: redirectUri,
       });
+      const authorizeUrl = `${IMS_ORIGIN}/ims/authorize/v2?${params}`;
+
+      const redirectUrl = await chrome.identity.launchWebAuthFlow({
+        url: authorizeUrl,
+        interactive: true,
+      });
+
+      if (!redirectUrl) throw new Error('Sign-in cancelled');
+
+      // Token lives in the URL fragment: …#access_token=xxx&expires_in=yyy&…
+      const hashIdx = redirectUrl.indexOf('#');
+      if (hashIdx === -1) throw new Error('No fragment in redirect URL');
+      const fragment = new URLSearchParams(redirectUrl.slice(hashIdx + 1));
+      const imsError = fragment.get('error');
+      if (imsError) {
+        const desc = fragment.get('error_description') ?? 'no description';
+        throw new Error(`IMS auth error: ${imsError} — ${desc}`);
+      }
+      const accessToken = fragment.get('access_token');
+      if (!accessToken) throw new Error('No access_token in redirect fragment');
+
+      return accessToken;
     } finally {
       pendingAuthPromise = null;
     }

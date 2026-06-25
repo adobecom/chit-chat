@@ -6,20 +6,13 @@
 
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnxu2WHX9f86MTo2hJ9tqcqK9GKRgPE+DVSKCRKEscJxlHybwcIoZXIy4dDOItVL9//vdUzdGnelL4ryZwv70bX7xX4UAkbc+lc4VPVcdDyW+YwaLC4Zlfb63OqP3HuBKP0+QSD3Z0fSw7eZe8sJbwu2hjAx320DaeiVOq5EJyzvmFl1Kvi0rTa/bKN7Pv2cuVjR6eQAZgjqD26Csbhkg3nNFBE11y7vTR7lUxesa2JzzeJpWe9HgrudZxrv2DVn2cOzlJYwhjiijlsPEWJrFFzD/vuskkl2x9x8Z1O/wtaR+QafdQbGwsZjN8pBa7BkCHiVlgPIalw4KOfE7QFRXzQIDAQAB",
 
-  "permissions": ["sidePanel", "activeTab", "scripting", "storage", "tabs"],
+  "permissions": ["sidePanel", "activeTab", "scripting", "storage", "tabs", "identity"],
   "host_permissions": [
     "https://milo-core-prod.adobe.io/*",
     "https://milo-core-stage.adobe.io/*",
     "https://ims-na1.adobelogin.com/*",
     "https://ims-na1-stg1.adobelogin.com/*"
   ],
-
-  "externally_connectable": {
-    "matches": [
-      "https://milo-core-prod.adobe.io/*",
-      "https://milo-core-stage.adobe.io/*"
-    ]
-  },
 
   "background": {
     "service_worker": "dist/background.js",
