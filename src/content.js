@@ -1,14 +1,19 @@
 /**
  * content.js — Chit Chat content script.
  *
- * Runs in the host page's MAIN world (world: "MAIN" in the manifest/SW).
+ * Runs in the ISOLATED world (Chrome's default for content scripts) so that
+ * chrome.runtime messaging works correctly.
  * Owns everything that requires live host-DOM access:
  *   - Anchor capture (same JSON shape as the original page-commenter so stored
  *     threads stay resolvable) and resolution cascade
  *   - Overlay: dot markers + shape markers
  *   - Element-picker mode, shape-draw mode, text-selection button
  *   - Scroll-to-thread / flash
- *   - SPA-navigation hooks + MutationObserver for anchor re-resolution
+ *   - SPA-navigation detection via the 'cc:navigated' CustomEvent, which is
+ *     dispatched from a tiny MAIN-world shim injected by background.js that
+ *     wraps history.pushState / replaceState. popstate/hashchange are also
+ *     listened to directly (they fire in the ISOLATED world as well).
+ *   - MutationObserver for anchor re-resolution
  *
  * Communicates with the service worker via chrome.runtime.sendMessage.
  * Never makes fetch() calls directly — all network I/O lives in background.js.
@@ -174,29 +179,48 @@ if (window.__chitChatLoaded) {
     s.id = 'cc-styles';
     s.textContent = `
       #cc-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 2147483640; overflow: visible; }
-      .cc-dot { position: absolute; width: 20px; height: 20px; border-radius: 50%;
+      .cc-dot { position: absolute; width: 22px; height: 22px; border-radius: 50%;
                 box-shadow: 0 2px 8px rgba(0,0,0,.35); cursor: pointer; pointer-events: all;
                 transform: translate(-50%,-50%); transition: transform .1s;
                 display: flex; align-items: center; justify-content: center;
-                font: bold 10px/1 sans-serif; color: #fff; }
+                font: bold 10px/1 sans-serif; color: #fff;
+                border: 2px solid #fff; box-sizing: border-box; }
       .cc-dot:hover { transform: translate(-50%,-50%) scale(1.2); }
-      .cc-dot--open    { background: #0265DC; }
-      .cc-dot--resolved{ background: #0265DC; }
-      .cc-dot--approximate { background: #E68619; }
-      .cc-dot--closed  { background: #6D6D6D; }
-      .cc-dot--approved{ background: #2D9D78; }
+      /* Status ring colors (background is now per-user, set inline) */
+      .cc-dot--open        { border-color: #0265DC; }
+      .cc-dot--in_progress { border-color: #E68619; }
+      .cc-dot--resolved    { border-color: #2D9D78; }
+      .cc-dot--approximate { border-color: #E68619; }
       .cc-shape { position: absolute; pointer-events: all; cursor: pointer;
                   border: 2px solid #0265DC; background: rgba(2,101,220,.08);
                   box-sizing: border-box; }
       .cc-shape--ellipse { border-radius: 50%; }
-      .cc-shape--closed  { border-color: #6D6D6D; background: rgba(109,109,109,.08); }
-      .cc-shape--approved{ border-color: #2D9D78; background: rgba(45,157,120,.08); }
-      /* element-picker highlight */
+      .cc-shape--in_progress { border-color: #E68619; background: rgba(230,134,25,.08); }
+      .cc-shape--resolved    { border-color: #2D9D78; background: rgba(45,157,120,.08); }
+      /* element-picker highlight overlay */
       #cc-element-picker { position: fixed; inset: 0; z-index: 2147483641;
                            pointer-events: none; }
       .cc-el-highlight { position: absolute; background: rgba(2,101,220,.12);
                          outline: 2px solid #0265DC; box-sizing: border-box;
                          pointer-events: none; border-radius: 2px; }
+      .cc-el-tag { position: absolute; top: -20px; left: 0; background: #0265DC;
+                   color: #fff; font: 11px/16px monospace; padding: 0 4px;
+                   border-radius: 2px; white-space: nowrap; }
+      /* element-picker disambiguation menu */
+      #cc-picker-menu { position: fixed; z-index: 2147483646; background: #fff;
+                        border: 1px solid #ccc; border-radius: 6px;
+                        box-shadow: 0 8px 32px rgba(0,0,0,.2); padding: 6px;
+                        min-width: 220px; font: 12px/1.4 -apple-system, sans-serif; }
+      .cc-picker-label { font-size: 11px; color: #6d6d6d; margin: 4px 6px 6px;
+                         text-transform: uppercase; letter-spacing: .04em; }
+      .cc-picker-list { list-style: none; margin: 0; padding: 0; }
+      .cc-picker-item { padding: 6px 8px; border-radius: 4px; cursor: pointer;
+                        display: flex; align-items: center; gap: 6px; color: #1b1b1b; }
+      .cc-picker-item:hover { background: #ebebeb; }
+      .cc-picker-item code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px;
+                             font: 11px/1.4 monospace; }
+      .cc-picker-item span { color: #6d6d6d; font-size: 11px; overflow: hidden;
+                             text-overflow: ellipsis; white-space: nowrap; }
       /* shape draw */
       #cc-shape-draw { position: fixed; inset: 0; z-index: 2147483641;
                        cursor: crosshair; }
@@ -271,6 +295,24 @@ if (window.__chitChatLoaded) {
     return map;
   }
 
+  /**
+   * Derive a deterministic background color from an author string.
+   * Hashes the string to a hue and returns an HSL color.
+   * Empty / unknown authors get a neutral gray.
+   */
+  function colorForUser(author) {
+    if (!author) return '#6d6d6d';
+    let h = 0;
+    for (let i = 0; i < author.length; i++) {
+      h = (h * 31 + author.charCodeAt(i)) & 0xffffffff;
+    }
+    // Map to a hue in [0, 360), skip the yellow-green band (80–140) that
+    // clashes with the status ring colors.
+    const raw = ((h >>> 0) % 360);
+    const hue = raw < 80 ? raw : raw < 140 ? raw + 80 : raw;
+    return `hsl(${hue % 360}, 60%, 42%)`;
+  }
+
   function renderDotMarker(overlay, thread, el) {
     const rect = el.getBoundingClientRect();
     const dot = document.createElement('div');
@@ -281,6 +323,14 @@ if (window.__chitChatLoaded) {
     dot.style.top = `${rect.top}px`;
     dot.dataset.threadId = thread.id;
     dot.title = thread.title ?? '';
+
+    // Per-user color as background; status drives the ring (border-color via CSS class).
+    const author = thread.comments?.[0]?.author_name ?? '';
+    dot.style.background = colorForUser(author);
+
+    // Show the author's first initial inside the dot (mirrors milo DotMarker.js).
+    dot.textContent = (author || '?')[0].toUpperCase();
+
     dot.addEventListener('click', () => toPanel('cc:panel:dotClicked', { threadId: thread.id }));
     overlay.appendChild(dot);
   }
@@ -288,7 +338,9 @@ if (window.__chitChatLoaded) {
   function renderShapeMarker(overlay, thread) {
     const a = thread.anchor;
     const shape = document.createElement('div');
-    shape.className = `cc-shape${a.shape === 'ellipse' ? ' cc-shape--ellipse' : ''}${thread.status === 'closed' ? ' cc-shape--closed' : thread.status === 'approved' ? ' cc-shape--approved' : ''}`;
+    const statusMod = (thread.status === 'in_progress' || thread.status === 'resolved')
+      ? ` cc-shape--${thread.status}` : '';
+    shape.className = `cc-shape${a.shape === 'ellipse' ? ' cc-shape--ellipse' : ''}${statusMod}`;
     // Shape anchors are stored as page (document) coordinates. Overlay is
     // position:fixed, so subtract scroll to convert to viewport coordinates.
     shape.style.left = `${a.x - window.scrollX}px`;
@@ -370,6 +422,89 @@ if (window.__chitChatLoaded) {
 
   let _pickerEl = null;
   let _highlightEl = null;
+  let _tagEl = null;
+
+  /** Return the z-ordered stack of page elements at (x, y), excluding our own UI. */
+  function getPickerCandidates(x, y) {
+    return document.elementsFromPoint(x, y).filter(
+      (el) => !isOwnUi(el)
+        && el.tagName !== 'HTML' && el.tagName !== 'HEAD' && el.tagName !== 'BODY',
+    );
+  }
+
+  /** Move the highlight overlay to cover `el` and show its tag name. */
+  function highlightPickerEl(el) {
+    if (!_highlightEl) return;
+    const rect = el.getBoundingClientRect();
+    Object.assign(_highlightEl.style, {
+      display: 'block',
+      left: `${rect.left}px`, top: `${rect.top}px`,
+      width: `${rect.width}px`, height: `${rect.height}px`,
+    });
+    if (_tagEl) _tagEl.textContent = `<${el.tagName.toLowerCase()}>`;
+  }
+
+  function hideHighlight() {
+    if (_highlightEl) _highlightEl.style.display = 'none';
+  }
+
+  /**
+   * Describe an element for a picker row: `tag#id` or `tag.class` in a <code>
+   * chip, followed by up to 25 chars of text content.
+   */
+  function describePickerEl(el) {
+    const tag = el.tagName.toLowerCase();
+    const id = el.id ? `#${el.id}` : '';
+    const cls = el.classList[0] ? `.${el.classList[0]}` : '';
+    const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 25);
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `<code>${esc(tag + (id || cls))}</code>${text ? ` <span>${esc(text)}</span>` : ''}`;
+  }
+
+  /**
+   * When >1 candidates exist, show the disambiguation dropdown listing the
+   * full z-stack so the user can pick the intended element — mirrors
+   * milo-logs-deploy CommentModeLayer.js `showPicker`.
+   */
+  function showElementPicker(candidates, x, y) {
+    document.getElementById('cc-picker-menu')?.remove();
+    const menu = document.createElement('div');
+    menu.id = 'cc-picker-menu';
+    const items = candidates.slice(0, 7);
+    menu.innerHTML = `<p class="cc-picker-label">Pick an element:</p>`
+      + `<ul class="cc-picker-list">${
+        items.map((el, i) => `<li class="cc-picker-item" data-idx="${i}">${describePickerEl(el)}</li>`).join('')
+      }</ul>`;
+
+    // Position near cursor, flip left/up if it would overflow the viewport.
+    const mw = 240; const mh = 30 + items.length * 32;
+    menu.style.left = `${Math.max(0, x + mw > window.innerWidth  ? x - mw : x)}px`;
+    menu.style.top  = `${Math.max(0, y + mh > window.innerHeight ? y - mh : y)}px`;
+    document.documentElement.appendChild(menu);
+
+    const cleanup = () => {
+      document.removeEventListener('keydown', onMenuKey, true);
+      document.removeEventListener('mousedown', onMenuOutside, true);
+    };
+    const onMenuKey = (ev) => {
+      if (ev.key === 'Escape') { menu.remove(); hideHighlight(); cleanup(); }
+    };
+    const onMenuOutside = (ev) => {
+      if (!menu.contains(ev.target)) { menu.remove(); hideHighlight(); cleanup(); }
+    };
+
+    menu.querySelectorAll('.cc-picker-item').forEach((li, i) => {
+      li.addEventListener('click', () => {
+        menu.remove(); hideHighlight(); cleanup();
+        openCompose(items[i], null, x, y);
+      });
+      li.addEventListener('mouseenter', () => highlightPickerEl(items[i]));
+      li.addEventListener('mouseleave', () => hideHighlight());
+    });
+
+    document.addEventListener('keydown', onMenuKey, true);
+    setTimeout(() => document.addEventListener('mousedown', onMenuOutside, true), 0);
+  }
 
   function startElementPicker() {
     if (_pickerEl) return;
@@ -379,6 +514,10 @@ if (window.__chitChatLoaded) {
 
     _highlightEl = document.createElement('div');
     _highlightEl.className = 'cc-el-highlight';
+    _highlightEl.style.display = 'none';
+    _tagEl = document.createElement('span');
+    _tagEl.className = 'cc-el-tag';
+    _highlightEl.appendChild(_tagEl);
     _pickerEl.appendChild(_highlightEl);
 
     document.body.style.cursor = 'crosshair';
@@ -388,7 +527,8 @@ if (window.__chitChatLoaded) {
   }
 
   function stopElementPicker() {
-    if (_pickerEl) { _pickerEl.remove(); _pickerEl = null; _highlightEl = null; }
+    document.getElementById('cc-picker-menu')?.remove();
+    if (_pickerEl) { _pickerEl.remove(); _pickerEl = null; _highlightEl = null; _tagEl = null; }
     document.body.style.cursor = '';
     document.removeEventListener('mousemove', onPickerMove, { capture: true });
     document.removeEventListener('click', onPickerClick, { capture: true });
@@ -396,33 +536,42 @@ if (window.__chitChatLoaded) {
   }
 
   let _pickerTarget = null;
+  let _pickerCandidates = [];
   function onPickerMove(e) {
-    const els = document.elementsFromPoint(e.clientX, e.clientY)
-      .filter((el) => !isOwnUi(el));
-    const el = els[0];
-    if (!el || el === document.documentElement || el === document.body) return;
+    const candidates = getPickerCandidates(e.clientX, e.clientY);
+    // Prefer non-canvas/video as the hover target (mirrors milo).
+    const el = candidates.find((c) => c.tagName !== 'CANVAS' && c.tagName !== 'VIDEO')
+      || candidates[0];
+    if (!el) return;
     _pickerTarget = el;
-    const rect = el.getBoundingClientRect();
-    if (_highlightEl) {
-      Object.assign(_highlightEl.style, {
-        left: `${rect.left}px`, top: `${rect.top}px`,
-        width: `${rect.width}px`, height: `${rect.height}px`,
-      });
-    }
+    _pickerCandidates = candidates;
+    highlightPickerEl(el);
   }
 
   function onPickerClick(e) {
     if (isOwnUi(e.target)) return;
     e.preventDefault(); e.stopPropagation();
-    const el = _pickerTarget;
-    if (!el) return;
+    const candidates = getPickerCandidates(e.clientX, e.clientY);
+    if (!candidates.length) return;
+    hideHighlight();
     stopElementPicker();
     _mode = null;
-    openCompose(el, null, e.clientX, e.clientY);
+    if (candidates.length === 1) {
+      openCompose(candidates[0], null, e.clientX, e.clientY);
+    } else {
+      // Re-show picker overlay briefly for the menu hover highlights.
+      startElementPicker();
+      showElementPicker(candidates, e.clientX, e.clientY);
+    }
   }
 
   function onPickerKey(e) {
-    if (e.key === 'Escape') { stopElementPicker(); _mode = null; toPanel('cc:panel:modeCancelled', {}); }
+    if (e.key === 'Escape') {
+      document.getElementById('cc-picker-menu')?.remove();
+      stopElementPicker();
+      _mode = null;
+      toPanel('cc:panel:modeCancelled', {});
+    }
   }
 
   // ── Shape draw ─────────────────────────────────────────────────────────────
@@ -617,10 +766,10 @@ if (window.__chitChatLoaded) {
     toPanel('cc:panel:pageUrl', { pageUrl: url });
   }
 
-  const origPush = history.pushState.bind(history);
-  const origReplace = history.replaceState.bind(history);
-  history.pushState = function (...args) { const r = origPush(...args); onPageNavigated(); return r; };
-  history.replaceState = function (...args) { const r = origReplace(...args); onPageNavigated(); return r; };
+  // history.pushState/replaceState are intercepted by a MAIN-world shim injected
+  // by background.js, which re-fires them as a 'cc:navigated' CustomEvent on window.
+  // DOM CustomEvents cross the MAIN/ISOLATED boundary, so we receive them here.
+  window.addEventListener('cc:navigated', onPageNavigated);
   window.addEventListener('popstate', onPageNavigated);
   window.addEventListener('hashchange', onPageNavigated);
 

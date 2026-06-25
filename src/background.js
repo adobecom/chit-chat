@@ -3,31 +3,32 @@
  *
  * Responsibilities:
  *   1. Action click → open side panel + inject content script into the active tab.
- *   2. IMS auth via the milo-core /ext-auth relay page + chrome.runtime.onMessageExternal.
+ *   2. IMS auth via chrome.identity.launchWebAuthFlow (implicit grant, response_type=token).
+ *      The manifest "key" pins the extension ID to nafgnogpgkcheonjkjjdfjjhnhllbkdh so
+ *      the chromiumapp.org redirect URI stays stable. Currently registered for stage IMS
+ *      only; prod requires the same redirect URI to be registered with Adobe IMS first.
  *   3. All /annotations network requests (host_permissions bypass CORS here).
  *   4. Message broker between the side panel and the active tab's content script.
  */
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-// Toggle 'stage' ↔ 'prod' to switch both the relay page and API together.
+// Toggle 'stage' ↔ 'prod' to switch both the IMS host and API together.
 const ENV = 'stage'; // 'stage' | 'prod'
 const HOSTS = {
   stage: {
-    server: 'https://milo-core-stage.adobe.io',
     api: 'https://milo-core-stage.adobe.io/annotations',
     ims: 'https://ims-na1-stg1.adobelogin.com',
   },
   prod: {
-    server: 'https://milo-core-prod.adobe.io',
     api: 'https://milo-core-prod.adobe.io/annotations',
     ims: 'https://ims-na1.adobelogin.com',
   },
 };
 const API_BASE   = HOSTS[ENV].api;
-const AUTH_PAGE  = `${HOSTS[ENV].server}/ext-auth`;
 const IMS_ORIGIN = HOSTS[ENV].ims;
 const CLIENT_ID  = 'milo-logs-claude-mcp';
+const SCOPES     = 'AdobeID,email,openid';
 const REQUEST_TIMEOUT_MS = 30_000;
 
 // ── Auth ───────────────────────────────────────────────────────────────────
@@ -54,18 +55,27 @@ async function getProfile() {
   return s.imsProfile ?? null;
 }
 
-/** Fetch the user profile from the IMS userinfo endpoint. Returns { name, email } or null. */
+/**
+ * Fetch the user profile from the OIDC userinfo endpoint.
+ * Returns { name, email, avatar } or null.
+ * Uses /ims/userinfo/v2 (requires client_id param; matches openid/profile/email scopes).
+ * Field names follow OIDC conventions: name / given_name+family_name / preferred_username / email.
+ */
 async function fetchUserProfile(token) {
   try {
-    const res = await fetch(`${IMS_ORIGIN}/ims/userinfo/v2`, {
+    const res = await fetch(`${IMS_ORIGIN}/ims/userinfo/v2?client_id=${CLIENT_ID}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
-    const data = await res.json();
-    return {
-      name: data.name ?? data.given_name ?? null,
-      email: data.email ?? null,
-    };
+    const d = await res.json();
+    const name = d.name
+      || `${d.given_name || ''} ${d.family_name || ''}`.trim()
+      || d.displayName
+      || d.preferred_username
+      || d.email
+      || null;
+    if (!name && !d.email) return null;
+    return { name, email: d.email ?? null, avatar: d.account?.avatar ?? d.avatar ?? null };
   } catch { return null; }
 }
 
@@ -73,56 +83,61 @@ async function fetchUserProfile(token) {
 let pendingAuthPromise = null;
 
 /**
- * Open the /ext-auth relay page in a popup and wait for the token message.
+ * Launch the Adobe IMS authorize page via chrome.identity.launchWebAuthFlow
+ * (implicit grant, response_type=token) and extract the access_token from the
+ * redirect URL fragment that Chrome intercepts.
  *
- * The relay page runs imslib, completes the IMS sign-in flow, then calls:
- *   chrome.runtime.sendMessage(extId, { type: 'pc-ims-token', access_token })
- * The service worker receives that via onMessageExternal, validates the sender
- * origin, and resolves the promise with the raw access token.
+ * The manifest "key" stabilises the extension ID so the registered
+ * chromiumapp.org redirect URI never changes across reloads.
  */
 async function acquireToken() {
   if (pendingAuthPromise) return pendingAuthPromise;
 
   pendingAuthPromise = (async () => {
     try {
-      return await new Promise((resolve, reject) => {
-        const url = `${AUTH_PAGE}?extId=${chrome.runtime.id}`;
-
-        // Window id is set asynchronously; use a promise so the listener and
-        // timeout can close it reliably even if they fire before the callback.
-        let resolveWinId;
-        const winIdPromise = new Promise(r => { resolveWinId = r; });
-        chrome.windows.create({ url, type: 'popup', width: 480, height: 360 }, win => {
-          resolveWinId(win?.id ?? null);
-        });
-
-        async function closeAuthWin() {
-          const id = await winIdPromise;
-          if (id !== null) chrome.windows.remove(id).catch(() => {});
-        }
-
-        const timeout = setTimeout(() => {
-          chrome.runtime.onMessageExternal.removeListener(onExtMessage);
-          pendingAuthPromise = null;
-          reject(new Error('Sign-in timed out'));
-          closeAuthWin();
-        }, 180_000);
-
-        function onExtMessage(message, sender, sendResponse) {
-          if (
-            message?.type !== 'pc-ims-token' ||
-            !message.access_token ||
-            sender.origin !== HOSTS[ENV].server
-          ) return;
-          clearTimeout(timeout);
-          chrome.runtime.onMessageExternal.removeListener(onExtMessage);
-          sendResponse({ ok: true });
-          closeAuthWin();
-          resolve(message.access_token);
-        }
-
-        chrome.runtime.onMessageExternal.addListener(onExtMessage);
+      const redirectUri = chrome.identity.getRedirectURL();
+      const params = new URLSearchParams({
+        client_id: CLIENT_ID,
+        scope: SCOPES,
+        response_type: 'token',
+        redirect_uri: redirectUri,
       });
+      const authorizeUrl = `${IMS_ORIGIN}/ims/authorize/v2?${params}`;
+
+      const redirectUrl = await chrome.identity.launchWebAuthFlow({
+        url: authorizeUrl,
+        interactive: true,
+      });
+
+      if (!redirectUrl) throw new Error('Sign-in cancelled');
+
+      // IMS may put errors in the query string (e.g. ?error=redirect_uri_mismatch)
+      // rather than the fragment in some failure modes.
+      const qIdx = redirectUrl.indexOf('?');
+      const hashIdx = redirectUrl.indexOf('#');
+      if (hashIdx === -1) {
+        if (qIdx !== -1) {
+          const query = new URLSearchParams(redirectUrl.slice(qIdx + 1));
+          const qError = query.get('error');
+          if (qError) {
+            const desc = query.get('error_description') ?? 'no description';
+            throw new Error(`IMS auth error: ${qError} — ${desc}`);
+          }
+        }
+        throw new Error(`No fragment in redirect URL — check SW console for the full redirect URL`);
+      }
+
+      // Token lives in the URL fragment: …#access_token=xxx&expires_in=yyy&…
+      const fragment = new URLSearchParams(redirectUrl.slice(hashIdx + 1));
+      const imsError = fragment.get('error');
+      if (imsError) {
+        const desc = fragment.get('error_description') ?? 'no description';
+        throw new Error(`IMS auth error: ${imsError} — ${desc}`);
+      }
+      const accessToken = fragment.get('access_token');
+      if (!accessToken) throw new Error('No access_token in redirect fragment');
+
+      return accessToken;
     } finally {
       pendingAuthPromise = null;
     }
@@ -285,10 +300,53 @@ async function handleMessage(msg, sender) {
   throw new Error(`unknown message type: ${type}`);
 }
 
+// ── Content script injection ───────────────────────────────────────────────
+
+// Tracks which tab the side panel is currently attached to, so we can
+// re-inject content.js when that tab navigates to a new page.
+let panelTabId = null;
+
+function navShimFn() {
+  if (window.__chitChatNavShim) return;
+  window.__chitChatNavShim = true;
+  const fire = () => window.dispatchEvent(new CustomEvent('cc:navigated'));
+  const op = history.pushState.bind(history);
+  const or = history.replaceState.bind(history);
+  history.pushState = function (...a) { const r = op(...a); fire(); return r; };
+  history.replaceState = function (...a) { const r = or(...a); fire(); return r; };
+}
+
+async function injectContentScript(tabId) {
+  // content.js runs in the ISOLATED world (default) so chrome.runtime messaging works.
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['dist/content.js'],
+  });
+  // MAIN-world shim re-dispatches history.pushState/replaceState as the 'cc:navigated'
+  // CustomEvent so the ISOLATED-world content script can detect SPA navigations.
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: navShimFn,
+  });
+}
+
+// Re-inject content.js when the panel's tab navigates to a new page.
+chrome.tabs.onUpdated.addListener(async (tabId, info) => {
+  if (tabId !== panelTabId || info.status !== 'complete') return;
+  try {
+    await injectContentScript(tabId);
+  } catch {
+    // Non-injectable page (chrome://, about:, etc.) — ignore.
+  }
+});
+
 // ── Action click ───────────────────────────────────────────────────────────
 
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab?.id) return;
+
+  panelTabId = tab.id;
 
   // Open the native side panel for this tab
   await chrome.sidePanel.open({ tabId: tab.id });
@@ -296,11 +354,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   // Inject the content script if it isn't already running.
   // executeScript throws on chrome://, about:, or extension pages — swallow those.
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['dist/content.js'],
-      world: 'MAIN', // needs page-world access (getBoundingClientRect, etc.)
-    });
+    await injectContentScript(tab.id);
   } catch (err) {
     // Not injectable (chrome:// page, etc.) — side panel still opens, content features
     // will be unavailable. Log to service-worker console only.

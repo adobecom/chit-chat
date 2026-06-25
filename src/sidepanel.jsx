@@ -12,7 +12,7 @@
  *   view       — 'list' | 'detail'
  *   activeId   — focused thread id (detail view)
  *   mode       — annotation mode: null|'element'|'rect'|'ellipse'
- *   auth       — { signedIn: bool, profile: { email, name }|null }
+ *   auth       — { signedIn: bool, profile: { email, name, avatar }|null }
  *   theme      — 'light'|'dark'
  */
 
@@ -101,8 +101,15 @@ const storage = {
   async set(key, val) { return new Promise(r => chrome.storage.sync.set({ [key]: val }, r)); },
 };
 
-async function getVoted(commentId) { return !!(await storage.get(`vote:${commentId}`)); }
-async function setVoted(commentId, v) { return storage.set(`vote:${commentId}`, v); }
+// Tri-state vote: 1 (up), -1 (down), 0 (none) — mirrors milo's localStorage-based model
+async function getMyVote(commentId) {
+  const v = Number(await storage.get(`vote:${commentId}`));
+  return (v === 1 || v === -1) ? v : 0;
+}
+async function setMyVote(commentId, v) {
+  if (v === 0) return storage.set(`vote:${commentId}`, null);
+  return storage.set(`vote:${commentId}`, v);
+}
 
 function stripHtml(html) {
   if (!html) return '';
@@ -111,11 +118,11 @@ function stripHtml(html) {
   return el.textContent ?? '';
 }
 
-// StatusLight variant by thread status
+// StatusLight variant by thread status (mirrors milo STATUS_VARIANT)
 function statusVariant(status) {
-  if (status === 'approved') return 'positive';
-  if (status === 'closed') return 'neutral';
-  return 'info'; // 'open' or undefined
+  if (status === 'in_progress') return 'informative';
+  if (status === 'resolved') return 'positive';
+  return 'notice'; // 'open' or undefined
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -134,6 +141,7 @@ function App() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [avatarFailed, setAvatarFailed] = useState(false);
   const pollRef = useRef(null);
 
   // ── Theme ────────────────────────────────────────────────────────────────
@@ -152,60 +160,89 @@ function App() {
     } catch { /* ignore */ }
   }, []);
   useEffect(() => { refreshAuth(); }, []);
+  // Reset avatar error state whenever the avatar URL changes (e.g. new sign-in)
+  const avatarUrl = auth.profile?.avatar ?? null;
+  useEffect(() => { setAvatarFailed(false); }, [avatarUrl]);
 
   // ── Tab tracking ──────────────────────────────────────────────────────────
   // The content script sends cc:panel:pageUrl on boot, but the panel may load
   // after that message was already sent. Read the tab URL directly so threads
   // load immediately without waiting for the next content-script event.
+  //
+  // Guard: only accept http(s) URLs and ignore known auth-flow domains
+  // (chromiumapp.org, adobelogin.com) so chrome.identity.launchWebAuthFlow
+  // doesn't clobber pageUrl when its popup becomes the active tab.
+  const panelWindowIdRef = useRef(null);
   useEffect(() => {
-    function applyTab(tab) {
-      if (!tab) return;
-      setTabId(tab.id);
-      const url = tab.url ? new URL(tab.url) : null;
-      if (url) setPageUrl(url.origin + url.pathname);
+    function isPageUrl(tab) {
+      if (!tab?.url) return false;
+      try {
+        const u = new URL(tab.url);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+        // Reject IMS auth redirect and the authorize page itself
+        if (u.hostname === 'chromiumapp.org' || u.hostname.endsWith('.chromiumapp.org')) return false;
+        if (u.hostname === 'adobelogin.com' || u.hostname.endsWith('.adobelogin.com')) return false;
+        return true;
+      } catch { return false; }
     }
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => applyTab(tabs[0]));
 
-    chrome.tabs.onActivated.addListener(({ tabId: tid }) => {
+    function applyTab(tab) {
+      if (!tab || !isPageUrl(tab)) return;
+      setTabId(tab.id);
+      const u = new URL(tab.url);
+      setPageUrl(u.origin + u.pathname);
+    }
+
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs[0]) {
+        panelWindowIdRef.current = tabs[0].windowId ?? null;
+        applyTab(tabs[0]);
+      }
+    });
+
+    chrome.tabs.onActivated.addListener(({ tabId: tid, windowId: wid }) => {
+      // Only track activations in the same window as the side panel
+      if (panelWindowIdRef.current !== null && wid !== panelWindowIdRef.current) return;
       chrome.tabs.get(tid, applyTab);
     });
-    chrome.tabs.onUpdated.addListener((tid, info, tab) => {
-      if (info.status === 'complete') {
-        chrome.tabs.query({ active: true, currentWindow: true }, (ts) => {
-          if (ts[0]?.id === tid) applyTab(ts[0]);
+    chrome.tabs.onUpdated.addListener((tid, info) => {
+      if (info.status === 'complete' && panelWindowIdRef.current !== null) {
+        chrome.tabs.query({ active: true, windowId: panelWindowIdRef.current }, (ts) => {
+          if (ts[0]?.id === tid) chrome.tabs.get(tid, applyTab);
         });
       }
     });
   }, []);
 
   // ── Fetch threads ─────────────────────────────────────────────────────────
-  const fetchThreads = useCallback(async (url) => {
+  const fetchThreads = useCallback(async (url, { silent = false } = {}) => {
     if (!url) return;
-    setLoading(true); setError(null);
+    if (!silent) { setLoading(true); setError(null); }
     try {
       const data = await sw('cc:api:fetchThreads', { pageUrl: url });
       setThreads(data?.threads ?? data ?? []);
+      refreshAuth(); // token may have been acquired implicitly by ensureToken — sync state
     } catch (err) {
       if (err.message?.includes('401') || err.message?.includes('auth')) {
         setAuth({ signedIn: false, profile: null });
       } else {
-        setError(err.message);
+        if (!silent) setError(err.message);
       }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
-  }, []);
+  }, [refreshAuth]);
 
-  // Re-fetch when URL changes
-  useEffect(() => { if (pageUrl) fetchThreads(pageUrl); }, [pageUrl]);
+  // Re-fetch when URL changes or sign-in state changes (so threads load immediately after sign-in)
+  useEffect(() => { if (pageUrl && auth.signedIn) fetchThreads(pageUrl); }, [pageUrl, auth.signedIn, fetchThreads]);
 
-  // Poll every 10s (pause when doc hidden)
+  // Poll every 10s (pause when doc hidden or signed out); silent so no spinner flash
   useEffect(() => {
-    if (!pageUrl) return;
-    const tick = () => { if (!document.hidden) fetchThreads(pageUrl); };
+    if (!pageUrl || !auth.signedIn) return;
+    const tick = () => { if (!document.hidden) fetchThreads(pageUrl, { silent: true }); };
     pollRef.current = setInterval(tick, 10_000);
     return () => clearInterval(pollRef.current);
-  }, [pageUrl]);
+  }, [pageUrl, auth.signedIn, fetchThreads]);
 
   // ── Push threads to content script overlay ────────────────────────────────
   useEffect(() => {
@@ -260,8 +297,25 @@ function App() {
   async function signIn() {
     try {
       await sw('cc:auth:signIn');
-      await refreshAuth();
-      if (pageUrl) fetchThreads(pageUrl);
+      await refreshAuth(); // sets auth.signedIn → true
+      // Immediately fetch threads for the current page rather than relying solely
+      // on the effect (which won't re-fire if pageUrl didn't change).
+      // Use the panel's own windowId so a focus shift during auth picks the right tab.
+      const wid = panelWindowIdRef.current;
+      const query = wid !== null ? { active: true, windowId: wid } : { active: true, currentWindow: true };
+      const tabs = await new Promise((res) => chrome.tabs.query(query, res));
+      const tab = tabs?.[0];
+      if (tab?.url) {
+        try {
+          const u = new URL(tab.url);
+          if (u.protocol === 'http:' || u.protocol === 'https:') {
+            const url = u.origin + u.pathname;
+            setPageUrl(url); // ensure pageUrl is in sync
+            // Silent so there's no spinner double-flash — the effect may also fire
+            await fetchThreads(url, { silent: true });
+          }
+        } catch { /* malformed URL — ignore */ }
+      }
     } catch (err) { setError(err.message); }
   }
 
@@ -283,7 +337,7 @@ function App() {
     if (statusFilter !== 'all' && t.status !== statusFilter) return false;
     if (search) {
       const q = search.toLowerCase();
-      const preview = (t.comments?.[0]?.body ?? '').toLowerCase();
+      const preview = stripHtml(t.comments?.[0]?.body ?? '').toLowerCase();
       if (!preview.includes(q) && !(t.anchor?.cssSelector ?? '').toLowerCase().includes(q)) return false;
     }
     return true;
@@ -301,9 +355,14 @@ function App() {
       <div className="cc-topbar">
         {auth.signedIn ? (
           <>
-            <div className="cc-avatar">
-              {initials(auth.profile?.name, auth.profile?.email)}
-            </div>
+            {auth.profile?.avatar && !avatarFailed
+              ? <img
+                  className="cc-avatar cc-avatar--img"
+                  src={auth.profile.avatar}
+                  alt=""
+                  onError={() => setAvatarFailed(true)}
+                />
+              : <div className="cc-avatar">{initials(auth.profile?.name, auth.profile?.email)}</div>}
             <span className="cc-identity-name">
               {auth.profile?.name ?? auth.profile?.email ?? 'Signed in'}
             </span>
@@ -347,34 +406,40 @@ function App() {
         </div>
       )}
 
-      {view === 'list'
-        ? <ThreadList
-            threads={filteredThreads}
-            resolution={resolution}
-            loading={loading}
-            search={search}
-            setSearch={setSearch}
-            statusFilter={statusFilter}
-            setStatusFilter={setStatusFilter}
-            onSelect={(id) => { setActiveId(id); setView('detail'); }}
-            tabId={tabId}
-          />
-        : <ThreadDetail
-            thread={activeThread}
-            resolution={resolution[activeId]}
-            tabId={tabId}
-            pageUrl={pageUrl}
-            onBack={() => { setView('list'); setActiveId(null); }}
-            onUpdate={(updated) => setThreads(ts => ts.map(t => t.id === updated.id ? updated : t))}
-            onDelete={() => {
-              setThreads(ts => ts.filter(t => t.id !== activeId));
-              setView('list'); setActiveId(null);
-            }}
-            onScrollTo={() => {
-              if (tabId && activeThread) toContent(tabId, 'cc:content:scrollTo', { threadId: activeId }).catch(() => {});
-            }}
-          />
-      }
+      {auth.signedIn ? (
+        view === 'list'
+          ? <ThreadList
+              threads={filteredThreads}
+              resolution={resolution}
+              loading={loading}
+              search={search}
+              setSearch={setSearch}
+              statusFilter={statusFilter}
+              setStatusFilter={setStatusFilter}
+              onSelect={(id) => { setActiveId(id); setView('detail'); }}
+              tabId={tabId}
+            />
+          : <ThreadDetail
+              thread={activeThread}
+              resolution={resolution[activeId]}
+              tabId={tabId}
+              pageUrl={pageUrl}
+              onBack={() => { setView('list'); setActiveId(null); }}
+              onUpdate={(updated) => setThreads(ts => ts.map(t => t.id === updated.id ? updated : t))}
+              onDelete={() => {
+                setThreads(ts => ts.filter(t => t.id !== activeId));
+                setView('list'); setActiveId(null);
+              }}
+              onScrollTo={() => {
+                if (tabId && activeThread) toContent(tabId, 'cc:content:scrollTo', { threadId: activeId }).catch(() => {});
+              }}
+            />
+      ) : (
+        <div className="cc-signed-out">
+          <p>Sign in with your Adobe ID to view and add annotations.</p>
+          <Button variant="accent" onPress={signIn}>Sign in</Button>
+        </div>
+      )}
 
       {/* Annotation mode buttons — bottom-left, auth-gated */}
       {auth.signedIn && (
@@ -432,8 +497,8 @@ function ThreadList({ threads, resolution, loading, search, setSearch, statusFil
         >
           <SegmentedControlItem id="all">All</SegmentedControlItem>
           <SegmentedControlItem id="open">Open</SegmentedControlItem>
-          <SegmentedControlItem id="approved">Approved</SegmentedControlItem>
-          <SegmentedControlItem id="closed">Closed</SegmentedControlItem>
+          <SegmentedControlItem id="in_progress">In progress</SegmentedControlItem>
+          <SegmentedControlItem id="resolved">Resolved</SegmentedControlItem>
         </SegmentedControl>
       </div>
 
@@ -475,9 +540,9 @@ function ThreadCard({ thread, resolution, onClick }) {
           aria-label={thread.status ?? 'open'}
           UNSAFE_style={{ marginRight: 2 }}
         />
-        <span className="cc-card-author">{firstComment?.author ?? '—'}</span>
+        <span className="cc-card-author">{firstComment?.author_name ?? '—'}</span>
         {isOrphaned && <Badge variant="neutral" size="S">orphaned</Badge>}
-        <span className="cc-card-time">{thread.createdAt ? relTime(thread.createdAt) : ''}</span>
+        <span className="cc-card-time">{thread.created_at ? relTime(thread.created_at) : ''}</span>
       </div>
       <div className="cc-card-preview">{preview}</div>
     </button>
@@ -505,10 +570,11 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, onBack, onUpdate, on
     } catch (err) { console.error(err); }
   }
 
-  // Called by AlertDialog onAction — no confirm() needed
   async function deleteThread() {
-    await sw('cc:api:deleteThread', { id: thread.id });
-    onDelete();
+    try {
+      await sw('cc:api:deleteThread', { id: thread.id });
+      onDelete();
+    } catch (err) { console.error('deleteThread:', err); }
   }
 
   async function postReply() {
@@ -542,8 +608,9 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, onBack, onUpdate, on
           <AlertDialog
             variant="destructive"
             title="Delete thread"
-            actionLabel="Delete"
-            onAction={deleteThread}
+            primaryActionLabel="Delete"
+            cancelLabel="Cancel"
+            onPrimaryAction={deleteThread}
           >
             Delete this thread and all its comments? This cannot be undone.
           </AlertDialog>
@@ -558,8 +625,8 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, onBack, onUpdate, on
           aria-label="Thread status"
         >
           <SegmentedControlItem id="open">Open</SegmentedControlItem>
-          <SegmentedControlItem id="approved">Approved</SegmentedControlItem>
-          <SegmentedControlItem id="closed">Closed</SegmentedControlItem>
+          <SegmentedControlItem id="in_progress">In progress</SegmentedControlItem>
+          <SegmentedControlItem id="resolved">Resolved</SegmentedControlItem>
         </SegmentedControl>
       </div>
 
@@ -614,15 +681,16 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, onBack, onUpdate, on
 function CommentItem({ comment, onUpdate, onDelete }) {
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(comment.body ?? '');
-  const [voted, setVotedState] = useState(false);
+  // Tri-state: 1 = upvoted, -1 = downvoted, 0 = not voted
+  const [myVote, setMyVoteState] = useState(0);
 
-  useEffect(() => { getVoted(comment.id).then(setVotedState); }, [comment.id]);
+  useEffect(() => { getMyVote(comment.id).then(setMyVoteState); }, [comment.id]);
 
   async function saveEdit() {
     const body = editText.trim();
     if (!body) return;
     const updated = await sw('cc:api:patchComment', { id: comment.id, body });
-    onUpdate({ ...comment, body: updated?.body ?? body });
+    onUpdate({ ...comment, body: updated?.body ?? body, edited_at: updated?.edited_at ?? comment.edited_at });
     setEditing(false);
   }
 
@@ -631,22 +699,27 @@ function CommentItem({ comment, onUpdate, onDelete }) {
     onDelete();
   }
 
-  async function vote(up) {
-    const next = !voted;
-    setVotedState(next);
-    await setVoted(comment.id, next);
-    const delta = next ? 1 : -1;
-    const updated = up
-      ? await sw('cc:api:voteComment', { id: comment.id, upvoteDelta: delta, downvoteDelta: 0 })
-      : await sw('cc:api:voteComment', { id: comment.id, upvoteDelta: 0, downvoteDelta: delta });
+  async function vote(dir) {
+    const prev = myVote;
+    // Clicking the active direction undoes it (toggle off → 0)
+    const next = prev === dir ? 0 : dir;
+    if (prev === next) return;
+    const upDelta   = (next === 1  ? 1 : 0) - (prev === 1  ? 1 : 0);
+    const downDelta = (next === -1 ? 1 : 0) - (prev === -1 ? 1 : 0);
+    setMyVoteState(next);
+    await setMyVote(comment.id, next);
+    const updated = await sw('cc:api:voteComment', {
+      id: comment.id, upvoteDelta: upDelta, downvoteDelta: downDelta,
+    });
     onUpdate({ ...comment, upvotes: updated?.upvotes ?? comment.upvotes, downvotes: updated?.downvotes ?? comment.downvotes });
   }
 
   return (
     <div className="cc-comment-block">
       <div className="cc-comment-header">
-        <span className="cc-comment-author">{comment.author ?? '?'}</span>
-        <span className="cc-comment-time">{comment.createdAt ? relTime(comment.createdAt) : ''}</span>
+        <span className="cc-comment-author">{comment.author_name ?? '?'}</span>
+        <span className="cc-comment-time">{comment.created_at ? relTime(comment.created_at) : ''}</span>
+        {comment.edited_at && <span className="cc-comment-edited">(edited)</span>}
         <span style={{ flex: 1 }} />
         <ActionButton isQuiet size="XS" aria-label="Edit comment" onPress={() => setEditing(!editing)}>
           <EditIcon />
@@ -670,31 +743,31 @@ function CommentItem({ comment, onUpdate, onDelete }) {
           </div>
         </div>
       ) : (
-        /* React auto-escapes text children — XSS-safe without extra sanitization */
-        <p className="cc-comment-body">{comment.body ?? ''}</p>
+        /* Strip any HTML from milo-authored bodies; plain-text input stays as-is */
+        <p className="cc-comment-body">{stripHtml(comment.body ?? '')}</p>
       )}
 
       <div className="cc-vote-row">
-        {/* ToggleButton for upvote so isSelected reflects the voted state */}
         <ToggleButton
           isQuiet
-          isSelected={voted}
-          onChange={() => vote(true)}
+          isSelected={myVote === 1}
+          onChange={() => vote(1)}
           size="S"
           aria-label={`Upvote (${comment.upvotes ?? 0})`}
         >
           <ThumbUpIcon />
           <Text>{comment.upvotes ?? 0}</Text>
         </ToggleButton>
-        <ActionButton
+        <ToggleButton
           isQuiet
+          isSelected={myVote === -1}
+          onChange={() => vote(-1)}
           size="S"
           aria-label={`Downvote (${comment.downvotes ?? 0})`}
-          onPress={() => vote(false)}
         >
           <ThumbDownIcon />
           <Text>{comment.downvotes ?? 0}</Text>
-        </ActionButton>
+        </ToggleButton>
       </div>
     </div>
   );

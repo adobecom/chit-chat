@@ -9,7 +9,7 @@ Click the Chit Chat toolbar icon on any AEM / DA Live page to open the panel and
 - **Side panel** — threads list, thread detail, comment compose, status management, votes, export. The browser docks and resizes the panel; no custom drag/snap UI.
 - **On-page overlay** — dot markers and shape markers positioned over the live DOM; element-picker mode, rectangle/ellipse shape mode, text-selection "+Comment" button.
 - **Backend** — `https://milo-core-prod.adobe.io/annotations` (the same Milo API as the bookmarklet, same anchor format, same stored data).
-- **Auth** — Adobe IMS via a relay page on the prod server. No IMS app-registration change required.
+- **Auth** — Adobe IMS via `chrome.identity.launchWebAuthFlow` (implicit grant). The redirect URI `https://<ext-id>.chromiumapp.org/` must be registered on the IMS client for the target environment.
 
 ## Load the extension (Developer mode)
 
@@ -58,7 +58,7 @@ content.js (injected into host page, MAIN world)
   ├─ scroll-to-thread, flash
   └─ SPA navigation hooks, MutationObserver
 
-sidepanel.html + dist/sidepanel.js (extension origin, Preact)
+sidepanel.html + dist/sidepanel.js (extension origin, React 19 + React Spectrum S2)
   ├─ thread list (search + filter)
   ├─ thread detail (status, comments, reply, delete)
   ├─ comment item (edit, vote)
