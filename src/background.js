@@ -291,10 +291,53 @@ async function handleMessage(msg, sender) {
   throw new Error(`unknown message type: ${type}`);
 }
 
+// ── Content script injection ───────────────────────────────────────────────
+
+// Tracks which tab the side panel is currently attached to, so we can
+// re-inject content.js when that tab navigates to a new page.
+let panelTabId = null;
+
+function navShimFn() {
+  if (window.__chitChatNavShim) return;
+  window.__chitChatNavShim = true;
+  const fire = () => window.dispatchEvent(new CustomEvent('cc:navigated'));
+  const op = history.pushState.bind(history);
+  const or = history.replaceState.bind(history);
+  history.pushState = function (...a) { const r = op(...a); fire(); return r; };
+  history.replaceState = function (...a) { const r = or(...a); fire(); return r; };
+}
+
+async function injectContentScript(tabId) {
+  // content.js runs in the ISOLATED world (default) so chrome.runtime messaging works.
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['dist/content.js'],
+  });
+  // MAIN-world shim re-dispatches history.pushState/replaceState as the 'cc:navigated'
+  // CustomEvent so the ISOLATED-world content script can detect SPA navigations.
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: navShimFn,
+  });
+}
+
+// Re-inject content.js when the panel's tab navigates to a new page.
+chrome.tabs.onUpdated.addListener(async (tabId, info) => {
+  if (tabId !== panelTabId || info.status !== 'complete') return;
+  try {
+    await injectContentScript(tabId);
+  } catch {
+    // Non-injectable page (chrome://, about:, etc.) — ignore.
+  }
+});
+
 // ── Action click ───────────────────────────────────────────────────────────
 
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab?.id) return;
+
+  panelTabId = tab.id;
 
   // Open the native side panel for this tab
   await chrome.sidePanel.open({ tabId: tab.id });
@@ -302,11 +345,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   // Inject the content script if it isn't already running.
   // executeScript throws on chrome://, about:, or extension pages — swallow those.
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['dist/content.js'],
-      world: 'MAIN', // needs page-world access (getBoundingClientRect, etc.)
-    });
+    await injectContentScript(tab.id);
   } catch (err) {
     // Not injectable (chrome:// page, etc.) — side panel still opens, content features
     // will be unavailable. Log to service-worker console only.

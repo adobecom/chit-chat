@@ -1,14 +1,19 @@
 /**
  * content.js — Chit Chat content script.
  *
- * Runs in the host page's MAIN world (world: "MAIN" in the manifest/SW).
+ * Runs in the ISOLATED world (Chrome's default for content scripts) so that
+ * chrome.runtime messaging works correctly.
  * Owns everything that requires live host-DOM access:
  *   - Anchor capture (same JSON shape as the original page-commenter so stored
  *     threads stay resolvable) and resolution cascade
  *   - Overlay: dot markers + shape markers
  *   - Element-picker mode, shape-draw mode, text-selection button
  *   - Scroll-to-thread / flash
- *   - SPA-navigation hooks + MutationObserver for anchor re-resolution
+ *   - SPA-navigation detection via the 'cc:navigated' CustomEvent, which is
+ *     dispatched from a tiny MAIN-world shim injected by background.js that
+ *     wraps history.pushState / replaceState. popstate/hashchange are also
+ *     listened to directly (they fire in the ISOLATED world as well).
+ *   - MutationObserver for anchor re-resolution
  *
  * Communicates with the service worker via chrome.runtime.sendMessage.
  * Never makes fetch() calls directly — all network I/O lives in background.js.
@@ -617,10 +622,10 @@ if (window.__chitChatLoaded) {
     toPanel('cc:panel:pageUrl', { pageUrl: url });
   }
 
-  const origPush = history.pushState.bind(history);
-  const origReplace = history.replaceState.bind(history);
-  history.pushState = function (...args) { const r = origPush(...args); onPageNavigated(); return r; };
-  history.replaceState = function (...args) { const r = origReplace(...args); onPageNavigated(); return r; };
+  // history.pushState/replaceState are intercepted by a MAIN-world shim injected
+  // by background.js, which re-fires them as a 'cc:navigated' CustomEvent on window.
+  // DOM CustomEvents cross the MAIN/ISOLATED boundary, so we receive them here.
+  window.addEventListener('cc:navigated', onPageNavigated);
   window.addEventListener('popstate', onPageNavigated);
   window.addEventListener('hashchange', onPageNavigated);
 

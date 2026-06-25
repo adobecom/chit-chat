@@ -185,6 +185,7 @@ function App() {
     try {
       const data = await sw('cc:api:fetchThreads', { pageUrl: url });
       setThreads(data?.threads ?? data ?? []);
+      refreshAuth(); // token may have been acquired implicitly by ensureToken — sync state
     } catch (err) {
       if (err.message?.includes('401') || err.message?.includes('auth')) {
         setAuth({ signedIn: false, profile: null });
@@ -194,18 +195,18 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [refreshAuth]);
 
   // Re-fetch when URL changes
   useEffect(() => { if (pageUrl) fetchThreads(pageUrl); }, [pageUrl]);
 
-  // Poll every 10s (pause when doc hidden)
+  // Poll every 10s (pause when doc hidden or signed out)
   useEffect(() => {
-    if (!pageUrl) return;
+    if (!pageUrl || !auth.signedIn) return;
     const tick = () => { if (!document.hidden) fetchThreads(pageUrl); };
     pollRef.current = setInterval(tick, 10_000);
     return () => clearInterval(pollRef.current);
-  }, [pageUrl]);
+  }, [pageUrl, auth.signedIn]);
 
   // ── Push threads to content script overlay ────────────────────────────────
   useEffect(() => {
@@ -347,34 +348,40 @@ function App() {
         </div>
       )}
 
-      {view === 'list'
-        ? <ThreadList
-            threads={filteredThreads}
-            resolution={resolution}
-            loading={loading}
-            search={search}
-            setSearch={setSearch}
-            statusFilter={statusFilter}
-            setStatusFilter={setStatusFilter}
-            onSelect={(id) => { setActiveId(id); setView('detail'); }}
-            tabId={tabId}
-          />
-        : <ThreadDetail
-            thread={activeThread}
-            resolution={resolution[activeId]}
-            tabId={tabId}
-            pageUrl={pageUrl}
-            onBack={() => { setView('list'); setActiveId(null); }}
-            onUpdate={(updated) => setThreads(ts => ts.map(t => t.id === updated.id ? updated : t))}
-            onDelete={() => {
-              setThreads(ts => ts.filter(t => t.id !== activeId));
-              setView('list'); setActiveId(null);
-            }}
-            onScrollTo={() => {
-              if (tabId && activeThread) toContent(tabId, 'cc:content:scrollTo', { threadId: activeId }).catch(() => {});
-            }}
-          />
-      }
+      {auth.signedIn ? (
+        view === 'list'
+          ? <ThreadList
+              threads={filteredThreads}
+              resolution={resolution}
+              loading={loading}
+              search={search}
+              setSearch={setSearch}
+              statusFilter={statusFilter}
+              setStatusFilter={setStatusFilter}
+              onSelect={(id) => { setActiveId(id); setView('detail'); }}
+              tabId={tabId}
+            />
+          : <ThreadDetail
+              thread={activeThread}
+              resolution={resolution[activeId]}
+              tabId={tabId}
+              pageUrl={pageUrl}
+              onBack={() => { setView('list'); setActiveId(null); }}
+              onUpdate={(updated) => setThreads(ts => ts.map(t => t.id === updated.id ? updated : t))}
+              onDelete={() => {
+                setThreads(ts => ts.filter(t => t.id !== activeId));
+                setView('list'); setActiveId(null);
+              }}
+              onScrollTo={() => {
+                if (tabId && activeThread) toContent(tabId, 'cc:content:scrollTo', { threadId: activeId }).catch(() => {});
+              }}
+            />
+      ) : (
+        <div className="cc-signed-out">
+          <p>Sign in with your Adobe ID to view and add annotations.</p>
+          <Button variant="accent" onPress={signIn}>Sign in</Button>
+        </div>
+      )}
 
       {/* Annotation mode buttons — bottom-left, auth-gated */}
       {auth.signedIn && (

@@ -259,6 +259,22 @@ html, body {
   gap: 4px;
 }
 
+/* ── Signed-out splash ────────────────────────────────────────────────────── */
+
+.cc-signed-out {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 32px 24px;
+  text-align: center;
+  font-size: 13px;
+  color: light-dark(#1b1b1b, #f5f5f5);
+  opacity: 0.8;
+}
+
 /* ── Annotation mode bar (bottom, auth-gated) ─────────────────────────────── */
 
 .cc-annotation-bar {
