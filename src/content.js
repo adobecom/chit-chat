@@ -343,14 +343,12 @@ if (window.__chitChatLoaded) {
     return `hsl(${hue % 360}, 60%, 42%)`;
   }
 
-  function renderDotMarker(overlay, thread, el) {
-    const rect = el.getBoundingClientRect();
+  // Builds a standalone `.cc-dot` element (color + author initial + status
+  // ring) shared by element-anchor and shape-anchor markers.
+  function createCommenterDot(thread) {
     const dot = document.createElement('div');
     const statusClass = `cc-dot--${thread.status ?? 'open'}`;
     dot.className = `cc-dot ${statusClass}`;
-    // Overlay is position:fixed — use viewport coords directly (no scroll offset).
-    dot.style.left = `${rect.left + rect.width / 2}px`;
-    dot.style.top = `${rect.top}px`;
     dot.dataset.threadId = thread.id;
     dot.title = thread.title ?? '';
 
@@ -361,7 +359,21 @@ if (window.__chitChatLoaded) {
     // Show the author's first initial inside the dot (mirrors milo DotMarker.js).
     dot.textContent = (author || '?')[0].toUpperCase();
 
-    dot.addEventListener('click', () => toPanel('cc:panel:dotClicked', { threadId: thread.id }));
+    // Shape markers nest this dot inside their own click target — stop the
+    // click from also bubbling to the shape's handler and double-firing.
+    dot.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toPanel('cc:panel:dotClicked', { threadId: thread.id });
+    });
+    return dot;
+  }
+
+  function renderDotMarker(overlay, thread, el) {
+    const rect = el.getBoundingClientRect();
+    const dot = createCommenterDot(thread);
+    // Overlay is position:fixed — use viewport coords directly (no scroll offset).
+    dot.style.left = `${rect.left + rect.width / 2}px`;
+    dot.style.top = `${rect.top}px`;
     overlay.appendChild(dot);
   }
 
@@ -380,6 +392,15 @@ if (window.__chitChatLoaded) {
     shape.dataset.threadId = thread.id;
     shape.addEventListener('click', () => toPanel('cc:panel:dotClicked', { threadId: thread.id }));
     overlay.appendChild(shape);
+
+    // Corner commenter badge: `.cc-dot` centers on its left/top via a
+    // translate(-50%,-50%) transform, and `.cc-shape` (its new containing
+    // block) has no transform of its own, so left/top: 0 lands the dot
+    // exactly on the shape's top-left corner.
+    const dot = createCommenterDot(thread);
+    dot.style.left = '0px';
+    dot.style.top = '0px';
+    shape.appendChild(dot);
   }
 
   // Reposition all markers on scroll/resize.
