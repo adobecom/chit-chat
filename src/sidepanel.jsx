@@ -282,7 +282,10 @@ function App() {
   async function handleNewThread(url, anchor, body) {
     try {
       const thread = await sw('cc:api:createThread', { pageUrl: url, anchor });
-      if (thread && body) await sw('cc:api:createComment', { threadId: thread.id, body });
+      if (thread && body) {
+        const authorName = auth.profile?.name ?? auth.profile?.email;
+        await sw('cc:api:createComment', { threadId: thread.id, body, authorName });
+      }
       await fetchThreads(url);
       if (thread) { setActiveId(thread.id); setView('detail'); }
     } catch (err) { setError(err.message); }
@@ -424,6 +427,7 @@ function App() {
               resolution={resolution[activeId]}
               tabId={tabId}
               pageUrl={pageUrl}
+              auth={auth}
               onBack={() => { setView('list'); setActiveId(null); }}
               onUpdate={(updated) => setThreads(ts => ts.map(t => t.id === updated.id ? updated : t))}
               onDelete={() => {
@@ -551,7 +555,7 @@ function ThreadCard({ thread, resolution, onClick }) {
 
 // ── Thread detail ─────────────────────────────────────────────────────────────
 
-function ThreadDetail({ thread, resolution, tabId, pageUrl, onBack, onUpdate, onDelete, onScrollTo }) {
+function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpdate, onDelete, onScrollTo }) {
   const [replyText, setReplyText] = useState('');
   const [posting, setPosting] = useState(false);
 
@@ -581,7 +585,8 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, onBack, onUpdate, on
     if (!replyText.trim()) return;
     setPosting(true);
     try {
-      const comment = await sw('cc:api:createComment', { threadId: thread.id, body: replyText.trim() });
+      const authorName = auth.profile?.name ?? auth.profile?.email;
+      const comment = await sw('cc:api:createComment', { threadId: thread.id, body: replyText.trim(), authorName });
       onUpdate({ ...thread, comments: [...(thread.comments ?? []), comment] });
       setReplyText('');
     } catch (err) { console.error(err); } finally { setPosting(false); }

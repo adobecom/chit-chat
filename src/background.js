@@ -5,8 +5,7 @@
  *   1. Action click → open side panel + inject content script into the active tab.
  *   2. IMS auth via chrome.identity.launchWebAuthFlow (implicit grant, response_type=token).
  *      The manifest "key" pins the extension ID to nafgnogpgkcheonjkjjdfjjhnhllbkdh so
- *      the chromiumapp.org redirect URI stays stable. Currently registered for stage IMS
- *      only; prod requires the same redirect URI to be registered with Adobe IMS first.
+ *      the chromiumapp.org redirect URI stays stable across stage and prod IMS clients.
  *   3. All /annotations network requests (host_permissions bypass CORS here).
  *   4. Message broker between the side panel and the active tab's content script.
  */
@@ -14,7 +13,7 @@
 // ── Constants ──────────────────────────────────────────────────────────────
 
 // Toggle 'stage' ↔ 'prod' to switch both the IMS host and API together.
-const ENV = 'stage'; // 'stage' | 'prod'
+const ENV = 'prod'; // 'stage' | 'prod'
 const HOSTS = {
   stage: {
     api: 'https://milo-core-stage.adobe.io/annotations',
@@ -244,7 +243,7 @@ async function handleMessage(msg, sender) {
   if (type === 'cc:api:createComment') {
     return apiRequest('/comments', {
       method: 'POST',
-      body: JSON.stringify({ thread_id: msg.threadId, body: msg.body }),
+      body: JSON.stringify({ thread_id: msg.threadId, body: msg.body, author_name: msg.authorName }),
     });
   }
   if (type === 'cc:api:patchComment') {

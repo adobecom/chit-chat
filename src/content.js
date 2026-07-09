@@ -206,21 +206,15 @@ if (window.__chitChatLoaded) {
       .cc-el-tag { position: absolute; top: -20px; left: 0; background: #0265DC;
                    color: #fff; font: 11px/16px monospace; padding: 0 4px;
                    border-radius: 2px; white-space: nowrap; }
-      /* element-picker disambiguation menu */
+      /* element-picker disambiguation menu (box/position only — its list
+         content lives in a shadow root, same reasoning as #cc-compose) */
       #cc-picker-menu { position: fixed; z-index: 2147483646; background: #fff;
                         border: 1px solid #ccc; border-radius: 6px;
                         box-shadow: 0 8px 32px rgba(0,0,0,.2); padding: 6px;
-                        min-width: 220px; font: 12px/1.4 -apple-system, sans-serif; }
-      .cc-picker-label { font-size: 11px; color: #6d6d6d; margin: 4px 6px 6px;
-                         text-transform: uppercase; letter-spacing: .04em; }
-      .cc-picker-list { list-style: none; margin: 0; padding: 0; }
-      .cc-picker-item { padding: 6px 8px; border-radius: 4px; cursor: pointer;
-                        display: flex; align-items: center; gap: 6px; color: #1b1b1b; }
-      .cc-picker-item:hover { background: #ebebeb; }
-      .cc-picker-item code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px;
-                             font: 11px/1.4 monospace; }
-      .cc-picker-item span { color: #6d6d6d; font-size: 11px; overflow: hidden;
-                             text-overflow: ellipsis; white-space: nowrap; }
+                        min-width: 220px; color: #1b1b1b;
+                        font: 12px/1.4 -apple-system, sans-serif; }
+      #cc-picker-menu.cc-dark { background: #2b2b2b; border-color: #555; color: #eee;
+                                box-shadow: 0 8px 32px rgba(0,0,0,.5); }
       /* shape draw */
       #cc-shape-draw { position: fixed; inset: 0; z-index: 2147483641;
                        cursor: crosshair; }
@@ -235,23 +229,58 @@ if (window.__chitChatLoaded) {
                     box-shadow: 0 2px 8px rgba(0,0,0,.3); user-select: none; }
       /* flash */
       .cc-flash { outline: 3px solid #0265DC !important; transition: outline .1s; }
-      /* compose popover */
+      /* compose popover (box/position only — its own text styling lives in a
+         shadow root so the host page's CSS can't bleed into the dialog) */
       #cc-compose { position: fixed; background: #fff; border-radius: 8px;
                     box-shadow: 0 8px 32px rgba(0,0,0,.2); padding: 12px;
-                    z-index: 2147483644; width: 320px; box-sizing: border-box; }
-      #cc-compose textarea { width: 100%; min-height: 80px; box-sizing: border-box;
-                              border: 1px solid #ccc; border-radius: 4px; padding: 8px;
-                              font: 13px/1.5 -apple-system, sans-serif; resize: vertical;
-                              outline-color: #0265DC; }
-      #cc-compose .cc-compose-actions { display: flex; gap: 8px; margin-top: 8px;
-                                         justify-content: flex-end; }
-      #cc-compose button { padding: 6px 14px; border-radius: 4px; border: 1px solid #ccc;
-                           cursor: pointer; font: 13px/1 -apple-system, sans-serif; }
-      #cc-compose .cc-compose-save { background: #0265DC; color: #fff; border-color: #0265DC; }
-      #cc-compose .cc-compose-cancel { background: #fff; }
+                    z-index: 2147483644; width: 320px; box-sizing: border-box;
+                    color: #1b1b1b; font: 13px/1.5 -apple-system, sans-serif; }
+      #cc-compose.cc-dark { background: #2b2b2b; color: #eee;
+                             box-shadow: 0 8px 32px rgba(0,0,0,.5); }
     `;
     document.head.appendChild(s);
   }
+
+  // Compose dialog's own styling, scoped inside its shadow root so page rules
+  // (e.g. a global `button { color: ... }` or `* { color: ... }` reset) can't
+  // reach in — no !important needed since the shadow boundary blocks the
+  // selectors from matching at all. `:host(.cc-dark)` mirrors the panel's
+  // light/dark toggle (synced via chrome.storage.sync, see _theme).
+  const COMPOSE_SHADOW_CSS = `
+    textarea { display: block; width: 100%; min-height: 80px; box-sizing: border-box;
+               border: 1px solid #ccc; border-radius: 4px; padding: 8px;
+               font: 13px/1.5 -apple-system, sans-serif; color: #1b1b1b; background: #fff;
+               resize: vertical; outline-color: #0265DC; }
+    .cc-compose-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+    button { padding: 6px 14px; border-radius: 4px; border: 1px solid #ccc;
+             cursor: pointer; font: 13px/1 -apple-system, sans-serif; color: #1b1b1b; background: #fff; }
+    .cc-compose-save { background: #0265DC; color: #fff; border-color: #0265DC; }
+    .cc-compose-cancel { background: #fff; color: #1b1b1b; }
+    :host(.cc-dark) textarea { background: #1e1e1e; border-color: #555; color: #eee; }
+    :host(.cc-dark) button { background: #3a3a3a; border-color: #555; color: #eee; }
+    :host(.cc-dark) .cc-compose-save { background: #0265DC; border-color: #0265DC; color: #fff; }
+    :host(.cc-dark) .cc-compose-cancel { background: #3a3a3a; color: #eee; }
+  `;
+
+  // Element-picker disambiguation dropdown's own styling — same shadow-root
+  // isolation + dark-mode approach as COMPOSE_SHADOW_CSS above.
+  const PICKER_SHADOW_CSS = `
+    .cc-picker-label { font-size: 11px; color: #6d6d6d; margin: 4px 6px 6px;
+                       text-transform: uppercase; letter-spacing: .04em; }
+    .cc-picker-list { list-style: none; margin: 0; padding: 0; }
+    .cc-picker-item { padding: 6px 8px; border-radius: 4px; cursor: pointer;
+                      display: flex; align-items: center; gap: 6px; color: #1b1b1b; }
+    .cc-picker-item:hover { background: #ebebeb; }
+    .cc-picker-item code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px;
+                           font: 11px/1.4 monospace; }
+    .cc-picker-item span { color: #6d6d6d; font-size: 11px; overflow: hidden;
+                           text-overflow: ellipsis; white-space: nowrap; }
+    :host(.cc-dark) .cc-picker-label { color: #aaa; }
+    :host(.cc-dark) .cc-picker-item { color: #eee; }
+    :host(.cc-dark) .cc-picker-item:hover { background: #3a3a3a; }
+    :host(.cc-dark) .cc-picker-item code { background: #1e1e1e; color: #eee; }
+    :host(.cc-dark) .cc-picker-item span { color: #aaa; }
+  `;
 
   // Create the fixed overlay container once
   function ensureOverlay() {
@@ -268,6 +297,7 @@ if (window.__chitChatLoaded) {
 
   let _threads = []; // cached from last cc:content:threads message
   let _resolvedMap = {}; // threadId → { element, status }
+  let _theme = 'light'; // synced from the panel's chrome.storage.sync 'theme' setting
 
   function renderMarkers() {
     const overlay = ensureOverlay();
@@ -343,8 +373,8 @@ if (window.__chitChatLoaded) {
     shape.className = `cc-shape${a.shape === 'ellipse' ? ' cc-shape--ellipse' : ''}${statusMod}`;
     // Shape anchors are stored as page (document) coordinates. Overlay is
     // position:fixed, so subtract scroll to convert to viewport coordinates.
-    shape.style.left = `${a.x - window.scrollX}px`;
-    shape.style.top = `${a.y - window.scrollY}px`;
+    shape.style.left = `${a.left - window.scrollX}px`;
+    shape.style.top = `${a.top - window.scrollY}px`;
     shape.style.width = `${a.width}px`;
     shape.style.height = `${a.height}px`;
     shape.dataset.threadId = thread.id;
@@ -370,8 +400,8 @@ if (window.__chitChatLoaded) {
       const t = _threads.find((x) => x.id === tid);
       if (!t?.anchor) continue;
       const a = t.anchor;
-      shape.style.left = `${a.x - window.scrollX}px`;
-      shape.style.top = `${a.y - window.scrollY}px`;
+      shape.style.left = `${a.left - window.scrollX}px`;
+      shape.style.top = `${a.top - window.scrollY}px`;
     }
   }
 
@@ -392,7 +422,7 @@ if (window.__chitChatLoaded) {
     const a = thread.anchor;
     if (!a) return;
     if (a.type === 'shape') {
-      window.scrollTo({ top: a.y + a.height / 2 - window.innerHeight / 2, behavior: 'smooth' });
+      window.scrollTo({ top: a.top + a.height / 2 - window.innerHeight / 2, behavior: 'smooth' });
       // flash the shape marker
       const marker = document.querySelector(`#cc-overlay .cc-shape[data-thread-id="${thread.id}"]`);
       flash(marker);
@@ -470,11 +500,21 @@ if (window.__chitChatLoaded) {
     document.getElementById('cc-picker-menu')?.remove();
     const menu = document.createElement('div');
     menu.id = 'cc-picker-menu';
+    if (_theme === 'dark') menu.classList.add('cc-dark');
     const items = candidates.slice(0, 7);
-    menu.innerHTML = `<p class="cc-picker-label">Pick an element:</p>`
+
+    // Same shadow-root isolation as the compose dialog: the page's own CSS
+    // can't reach the list/label/code text inside, so no !important needed.
+    const root = menu.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = PICKER_SHADOW_CSS;
+    root.appendChild(style);
+    const content = document.createElement('div');
+    content.innerHTML = `<p class="cc-picker-label">Pick an element:</p>`
       + `<ul class="cc-picker-list">${
         items.map((el, i) => `<li class="cc-picker-item" data-idx="${i}">${describePickerEl(el)}</li>`).join('')
       }</ul>`;
+    root.appendChild(content);
 
     // Position near cursor, flip left/up if it would overflow the viewport.
     const mw = 240; const mh = 30 + items.length * 32;
@@ -493,7 +533,7 @@ if (window.__chitChatLoaded) {
       if (!menu.contains(ev.target)) { menu.remove(); hideHighlight(); cleanup(); }
     };
 
-    menu.querySelectorAll('.cc-picker-item').forEach((li, i) => {
+    root.querySelectorAll('.cc-picker-item').forEach((li, i) => {
       li.addEventListener('click', () => {
         menu.remove(); hideHighlight(); cleanup();
         openCompose(items[i], null, x, y);
@@ -633,7 +673,7 @@ if (window.__chitChatLoaded) {
     const anchor = {
       type: 'shape',
       shape: _drawShape,
-      x: Math.round(x), y: Math.round(y),
+      left: Math.round(x), top: Math.round(y),
       width: Math.round(width), height: Math.round(height),
     };
     const currentShape = _drawShape;
@@ -687,6 +727,8 @@ if (window.__chitChatLoaded) {
 
   // ── Compose popover ────────────────────────────────────────────────────────
 
+  let _composeSaveBtn = null; // shadow-root button ref; can't querySelector across the boundary
+
   function openCompose(el, selection, cx, cy) {
     const anchor = captureAnchor(el, selection);
     openComposeWithAnchor(anchor, cx, cy);
@@ -696,6 +738,7 @@ if (window.__chitChatLoaded) {
     closeCompose();
     const pop = document.createElement('div');
     pop.id = 'cc-compose';
+    if (_theme === 'dark') pop.classList.add('cc-dark');
 
     // Position: prefer right/below the cursor, flip if too close to edge
     const W = window.innerWidth; const H = window.innerHeight;
@@ -705,9 +748,17 @@ if (window.__chitChatLoaded) {
     pop.style.left = `${left}px`;
     pop.style.top = `${top}px`;
 
+    // The dialog's contents live in a shadow root: the host page's CSS
+    // selectors can't cross the boundary, so its text can't be recolored by
+    // page-level `button`/`textarea`/`*` rules.
+    const root = pop.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = COMPOSE_SHADOW_CSS;
+    root.appendChild(style);
+
     const textarea = document.createElement('textarea');
     textarea.placeholder = 'Leave a comment…';
-    pop.appendChild(textarea);
+    root.appendChild(textarea);
 
     const actions = document.createElement('div');
     actions.className = 'cc-compose-actions';
@@ -730,24 +781,25 @@ if (window.__chitChatLoaded) {
     });
 
     actions.append(cancel, save);
-    pop.appendChild(actions);
+    root.appendChild(actions);
     document.body.appendChild(pop);
     textarea.focus();
 
+    _composeSaveBtn = save;
     document.addEventListener('keydown', onComposeKey);
   }
 
   function closeCompose() {
     const pop = document.getElementById('cc-compose');
     if (pop) pop.remove();
+    _composeSaveBtn = null;
     document.removeEventListener('keydown', onComposeKey);
   }
 
   function onComposeKey(e) {
     if (e.key === 'Escape') closeCompose();
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-      const save = document.querySelector('#cc-compose .cc-compose-save');
-      if (save) save.click();
+      if (_composeSaveBtn) _composeSaveBtn.click();
     }
   }
 
@@ -802,6 +854,9 @@ if (window.__chitChatLoaded) {
       _threads = msg.threads ?? [];
       _resolvedMap = resolveAll(_threads);
       renderMarkers();
+      toPanel('cc:panel:resolutionUpdated', {
+        resolution: Object.fromEntries(Object.entries(_resolvedMap).map(([id, r]) => [id, r.status])),
+      });
       return;
     }
     if (msg.type === 'cc:content:scrollTo') {
@@ -819,6 +874,13 @@ if (window.__chitChatLoaded) {
 
   injectStyles();
   ensureOverlay();
+
+  // Load the panel's light/dark preference so the compose dialog matches it,
+  // and stay in sync if the user toggles theme while this tab is open.
+  chrome.storage.sync.get('theme', (data) => { if (data.theme) _theme = data.theme; });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'sync' && changes.theme) _theme = changes.theme.newValue;
+  });
 
   // Report initial page URL to the panel
   toPanel('cc:panel:pageUrl', { pageUrl: window.location.origin + window.location.pathname });
