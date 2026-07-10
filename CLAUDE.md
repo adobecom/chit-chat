@@ -29,7 +29,7 @@ All cross-context communication goes through `chrome.runtime.sendMessage`. Messa
 ### background.js — Service Worker
 
 Central message router and API proxy. Key responsibilities:
-- **IMS auth**: uses `chrome.identity.launchWebAuthFlow` with an IMS implicit grant (`response_type=token`). The authorize URL targets `${IMS_ORIGIN}/ims/authorize/v2`; Chrome intercepts the `chromiumapp.org` redirect and hands the URL fragment (containing `access_token`) back to the service worker. Token stored in `chrome.storage.session`. A top-of-file `ENV = 'stage' | 'prod'` constant selects both the IMS host and the API host together. The manifest `key` pins the extension ID to `nafgnogpgkcheonjkjjdfjjhnhllbkdh` so the registered redirect URI (`https://nafgnogpgkcheonjkjjdfjjhnhllbkdh.chromiumapp.org/`) never changes across reloads. Currently only registered for stage IMS — prod requires a separate registration.
+- **IMS auth**: uses `chrome.identity.launchWebAuthFlow` with an IMS implicit grant (`response_type=token`). The authorize URL targets `${IMS_ORIGIN}/ims/authorize/v2`; Chrome intercepts the `chromiumapp.org` redirect and hands the URL fragment (containing `access_token`) back to the service worker. Token stored in `chrome.storage.session`. A top-of-file `ENV = 'stage' | 'prod'` constant selects both the IMS host and the API host together. The manifest `key` pins the extension ID to `nafgnogpgkcheonjkjjdfjjhnhllbkdh` so the registered redirect URI (`https://nafgnogpgkcheonjkjjdfjjhnhllbkdh.chromiumapp.org/`) never changes across reloads. Registered on both the stage and prod IMS clients.
 - **API proxy**: all `/annotations` requests go through here (host_permissions bypass CORS); includes Bearer auth, 30s timeout, and automatic token re-acquisition on 401
 - **Tab management**: opens the side panel on toolbar click; injects content.js into the active tab
 
@@ -74,8 +74,8 @@ S2's `style()` macro (`@react-spectrum/s2/style` with `{ type: 'macro' }`) is av
 
 ## Key Constants
 
-- `ENV = 'stage'` — controls both IMS host and API host; flip to `'prod'` once the redirect URI is registered for prod IMS
-- `API_BASE = HOSTS[ENV].api` (stage: `https://milo-core-stage.adobe.io/annotations`)
+- `ENV = 'prod'` — controls both IMS host and API host; flip to `'stage'` for stage testing
+- `API_BASE = HOSTS[ENV].api` (prod: `https://milo-core-prod.adobe.io/annotations`)
 - `CLIENT_ID = 'milo-logs-claude-mcp'`
 - `SCOPES = 'AdobeID,openid,profile,email'`
 - Extension ID: `nafgnogpgkcheonjkjjdfjjhnhllbkdh` (pinned by manifest `key`)
