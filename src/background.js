@@ -55,26 +55,39 @@ async function getProfile() {
 }
 
 /**
- * Fetch the user profile from the OIDC userinfo endpoint.
- * Returns { name, email, avatar } or null.
- * Uses /ims/userinfo/v2 (requires client_id param; matches openid/profile/email scopes).
- * Field names follow OIDC conventions: name / given_name+family_name / preferred_username / email.
+ * Fetch the user profile from Adobe IMS.
+ * Returns { name, first, last, email, avatar } or null.
+ *
+ * Uses /ims/profile/v1 — unlike the OIDC /userinfo endpoint it returns the
+ * name fields (displayName / first_name / last_name) with only the AdobeID
+ * scope, so we don't need the `profile` scope (which milo-logs-claude-mcp
+ * isn't provisioned for — requesting it fails with invalid_scope).
  */
 async function fetchUserProfile(token) {
   try {
-    const res = await fetch(`${IMS_ORIGIN}/ims/userinfo/v2?client_id=${CLIENT_ID}`, {
+    const res = await fetch(`${IMS_ORIGIN}/ims/profile/v1?client_id=${CLIENT_ID}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
     const d = await res.json();
-    const name = d.name
-      || `${d.given_name || ''} ${d.family_name || ''}`.trim()
-      || d.displayName
-      || d.preferred_username
+    // Adobe IMS uses first_name/last_name/displayName; fall back to OIDC-style
+    // fields just in case, then the email local part.
+    const first = d.first_name ?? d.given_name ?? null;
+    const last = d.last_name ?? d.family_name ?? null;
+    const name = d.displayName
+      || d.name
+      || `${first || ''} ${last || ''}`.trim()
       || d.email
       || null;
     if (!name && !d.email) return null;
-    return { name, email: d.email ?? null, avatar: d.account?.avatar ?? d.avatar ?? null };
+    return {
+      name,
+      // Structured parts let the panel build first+last initials directly.
+      first,
+      last,
+      email: d.email ?? null,
+      avatar: d.account?.avatar ?? d.avatar ?? null,
+    };
   } catch { return null; }
 }
 

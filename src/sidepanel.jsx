@@ -25,20 +25,17 @@ import {
   Button,
   ActionButton,
   ToggleButton,
+  ToggleButtonGroup,
   Badge,
-  StatusLight,
   SearchField,
   ProgressCircle,
   InlineAlert,
   Heading,
   Text,
-  Content,
   Divider,
   DialogTrigger,
   AlertDialog,
   TextArea,
-  SegmentedControl,
-  SegmentedControlItem,
 } from '@react-spectrum/s2';
 import BrightnessContrastIcon from '@react-spectrum/s2/icons/BrightnessContrast';
 import ChevronLeftIcon from '@react-spectrum/s2/icons/ChevronLeft';
@@ -83,16 +80,33 @@ function relTime(iso) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function initials(name, email) {
+// Absolute date-time string, e.g. "Jul 10, 12:45 AM". Used inside a thread
+// (comments) where the precise time matters; the list keeps the terse relTime.
+function fmtDate(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// Two-letter initials from a profile: first + last name initial
+// (e.g. John Doe → "JD"). Prefers structured given/family name parts, then
+// falls back to splitting the display name, then the email local part.
+function initials(profile) {
+  const first = profile?.first?.trim();
+  const last = profile?.last?.trim();
+  if (first && last) return (first[0] + last[0]).toUpperCase();
+
+  const name = profile?.name?.trim();
   if (name) {
-    const parts = name.trim().split(/\s+/);
+    const parts = name.split(/\s+/);
     if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
     return parts[0].slice(0, 2).toUpperCase();
   }
-  if (email) {
-    const [local] = email.split('@');
-    return local.slice(0, 2).toUpperCase();
-  }
+
+  const email = profile?.email;
+  if (email) return email.split('@')[0].slice(0, 2).toUpperCase();
+
   return '?';
 }
 
@@ -118,8 +132,18 @@ function stripHtml(html) {
   return el.textContent ?? '';
 }
 
-// StatusLight variant by thread status (mirrors milo STATUS_VARIANT)
-function statusVariant(status) {
+const STATUSES = ['open', 'in_progress', 'resolved'];
+
+// Human-readable status label. Undefined/null is treated as 'open'.
+function statusLabel(status) {
+  if (status === 'in_progress') return 'In progress';
+  if (status === 'resolved') return 'Resolved';
+  return 'Open';
+}
+
+// S2 Badge variant per status — colored text/pill with theme-safe contrast
+// in both light and dark (S2 owns the fg/bg pairing).
+function statusBadgeVariant(status) {
   if (status === 'in_progress') return 'informative';
   if (status === 'resolved') return 'positive';
   return 'notice'; // 'open' or undefined
@@ -278,6 +302,31 @@ function App() {
     return () => chrome.runtime.onMessage.removeListener(onMsg);
   }, []);
 
+  // ── ESC cancels the active annotation mode ────────────────────────────────
+  // content.js already handles ESC while the host page is focused, but after
+  // toggling a tool button focus stays in the side panel, so ESC never reaches
+  // the page. Mirror that cancel here for panel-focused ESC.
+  useEffect(() => {
+    if (!mode) return undefined;
+    function onKey(e) {
+      if (e.key === 'Escape') {
+        setModeState(null);
+        if (tabId) toContent(tabId, 'cc:content:mode', { mode: null }).catch(() => {});
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mode, tabId]);
+
+  // ── Auto-scroll to the annotated element when a thread is opened ───────────
+  // Same effect as the detail-view "locate" button, but triggered automatically
+  // for every entry path (list click, on-page dot click, new-thread creation).
+  useEffect(() => {
+    if (view === 'detail' && activeId && tabId) {
+      toContent(tabId, 'cc:content:scrollTo', { threadId: activeId }).catch(() => {});
+    }
+  }, [view, activeId, tabId]);
+
   // ── Handlers ─────────────────────────────────────────────────────────────
   async function handleNewThread(url, anchor, body) {
     try {
@@ -337,11 +386,17 @@ function App() {
   }
 
   const filteredThreads = threads.filter((t) => {
-    if (statusFilter !== 'all' && t.status !== statusFilter) return false;
+    // Threads with no explicit status are treated as 'open' everywhere else.
+    if (statusFilter !== 'all' && (t.status || 'open') !== statusFilter) return false;
     if (search) {
       const q = search.toLowerCase();
       const preview = stripHtml(t.comments?.[0]?.body ?? '').toLowerCase();
-      if (!preview.includes(q) && !(t.anchor?.cssSelector ?? '').toLowerCase().includes(q)) return false;
+      // Match any comment author on the thread so the "comments and authors"
+      // search placeholder holds true.
+      const authors = (t.comments ?? []).map((c) => (c.author_name ?? '').toLowerCase());
+      if (!preview.includes(q)
+        && !authors.some((a) => a.includes(q))
+        && !(t.anchor?.cssSelector ?? '').toLowerCase().includes(q)) return false;
     }
     return true;
   });
@@ -365,7 +420,7 @@ function App() {
                   alt=""
                   onError={() => setAvatarFailed(true)}
                 />
-              : <div className="cc-avatar">{initials(auth.profile?.name, auth.profile?.email)}</div>}
+              : <div className="cc-avatar">{initials(auth.profile)}</div>}
             <span className="cc-identity-name">
               {auth.profile?.name ?? auth.profile?.email ?? 'Signed in'}
             </span>
@@ -449,31 +504,28 @@ function App() {
       {auth.signedIn && (
         <div className="cc-annotation-bar">
           <ToggleButton
-            isQuiet
             isSelected={mode === 'element'}
             onChange={() => toggleMode('element')}
-            aria-label="Element comment mode"
             size="S"
           >
             <CursorClickIcon />
+            <Text>Element</Text>
           </ToggleButton>
           <ToggleButton
-            isQuiet
             isSelected={mode === 'rect'}
             onChange={() => toggleMode('rect')}
-            aria-label="Rectangle annotation"
             size="S"
           >
             <SelectRectangleIcon />
+            <Text>Rectangle</Text>
           </ToggleButton>
           <ToggleButton
-            isQuiet
             isSelected={mode === 'ellipse'}
             onChange={() => toggleMode('ellipse')}
-            aria-label="Ellipse annotation"
             size="S"
           >
             <CircleIcon />
+            <Text>Ellipse</Text>
           </ToggleButton>
         </div>
       )}
@@ -484,26 +536,30 @@ function App() {
 // ── Thread list ───────────────────────────────────────────────────────────────
 
 function ThreadList({ threads, resolution, loading, search, setSearch, statusFilter, setStatusFilter, onSelect }) {
+  const isFiltered = statusFilter !== 'all' || !!search;
   return (
     <div className="cc-body">
       <div className="cc-search-area">
         <SearchField
           value={search}
           onChange={setSearch}
-          placeholder="Search…"
-          aria-label="Search threads"
+          placeholder="Search comments and authors…"
+          aria-label="Search comments and authors"
           width="100%"
         />
-        <SegmentedControl
-          selectedKey={statusFilter}
-          onSelectionChange={setStatusFilter}
+        <ToggleButtonGroup
+          selectionMode="single"
+          disallowEmptySelection
+          selectedKeys={[statusFilter]}
+          onSelectionChange={(keys) => setStatusFilter([...keys][0] ?? 'all')}
+          size="S"
           aria-label="Filter by status"
         >
-          <SegmentedControlItem id="all">All</SegmentedControlItem>
-          <SegmentedControlItem id="open">Open</SegmentedControlItem>
-          <SegmentedControlItem id="in_progress">In progress</SegmentedControlItem>
-          <SegmentedControlItem id="resolved">Resolved</SegmentedControlItem>
-        </SegmentedControl>
+          <ToggleButton id="all">All</ToggleButton>
+          <ToggleButton id="open">Open</ToggleButton>
+          <ToggleButton id="in_progress">In progress</ToggleButton>
+          <ToggleButton id="resolved">Resolved</ToggleButton>
+        </ToggleButtonGroup>
       </div>
 
       {loading && (
@@ -512,7 +568,9 @@ function ThreadList({ threads, resolution, loading, search, setSearch, statusFil
         </div>
       )}
       {!loading && threads.length === 0 && (
-        <div className="cc-empty">No annotations on this page yet.</div>
+        <div className="cc-empty">
+          {isFiltered ? 'No threads match the current filter.' : 'No annotations on this page yet.'}
+        </div>
       )}
 
       <div className="cc-list">
@@ -535,20 +593,26 @@ function ThreadCard({ thread, resolution, onClick }) {
   const firstComment = thread.comments?.[0];
   const preview = firstComment ? stripHtml(firstComment.body) : '(no comments)';
   const isOrphaned = resolution === 'unanchored';
+  const count = thread.comments?.length ?? 0;
 
   return (
     <button type="button" className="cc-thread-btn" onClick={onClick}>
-      <div className="cc-card-header">
-        <StatusLight
-          variant={statusVariant(thread.status)}
-          aria-label={thread.status ?? 'open'}
-          UNSAFE_style={{ marginRight: 2 }}
-        />
-        <span className="cc-card-author">{firstComment?.author_name ?? '—'}</span>
+      <div className="cc-card-status">
+        <Badge variant={statusBadgeVariant(thread.status)} size="S">
+          {statusLabel(thread.status)}
+        </Badge>
         {isOrphaned && <Badge variant="neutral" size="S">orphaned</Badge>}
-        <span className="cc-card-time">{thread.created_at ? relTime(thread.created_at) : ''}</span>
       </div>
       <div className="cc-card-preview">{preview}</div>
+      <div className="cc-card-meta">
+        <span className="cc-card-author">{firstComment?.author_name ?? '—'}</span>
+        <span className="cc-card-sep">·</span>
+        <span>{count} {count === 1 ? 'comment' : 'comments'}</span>
+        <span className="cc-card-sep">·</span>
+        <span title={thread.created_at ? fmtDate(thread.created_at) : ''}>
+          {thread.created_at ? relTime(thread.created_at) : ''}
+        </span>
+      </div>
     </button>
   );
 }
@@ -560,9 +624,17 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   const [posting, setPosting] = useState(false);
 
   if (!thread) {
+    // activeId is only ever set once the thread exists, so a missing thread
+    // here means it was deleted (by us elsewhere, another client, or dropped
+    // by the poll). Offer a way back instead of spinning forever.
     return (
-      <div className="cc-centered">
-        <ProgressCircle isIndeterminate aria-label="Loading" size="S" />
+      <div className="cc-detail">
+        <div className="cc-detail-header">
+          <ActionButton isQuiet aria-label="Back to list" onPress={onBack} size="S">
+            <ChevronLeftIcon />
+          </ActionButton>
+        </div>
+        <div className="cc-empty">This thread is no longer available.</div>
       </div>
     );
   }
@@ -624,15 +696,21 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
 
       {/* Status selector */}
       <div className="cc-detail-status">
-        <SegmentedControl
-          selectedKey={thread.status ?? 'open'}
-          onSelectionChange={changeStatus}
+        <ToggleButtonGroup
+          selectionMode="single"
+          disallowEmptySelection
+          selectedKeys={[thread.status ?? 'open']}
+          onSelectionChange={(keys) => {
+            const next = [...keys][0];
+            if (next && next !== (thread.status ?? 'open')) changeStatus(next);
+          }}
+          size="S"
           aria-label="Thread status"
         >
-          <SegmentedControlItem id="open">Open</SegmentedControlItem>
-          <SegmentedControlItem id="in_progress">In progress</SegmentedControlItem>
-          <SegmentedControlItem id="resolved">Resolved</SegmentedControlItem>
-        </SegmentedControl>
+          <ToggleButton id="open">Open</ToggleButton>
+          <ToggleButton id="in_progress">In progress</ToggleButton>
+          <ToggleButton id="resolved">Resolved</ToggleButton>
+        </ToggleButtonGroup>
       </div>
 
       <Divider size="S" />
@@ -723,7 +801,7 @@ function CommentItem({ comment, onUpdate, onDelete }) {
     <div className="cc-comment-block">
       <div className="cc-comment-header">
         <span className="cc-comment-author">{comment.author_name ?? '?'}</span>
-        <span className="cc-comment-time">{comment.created_at ? relTime(comment.created_at) : ''}</span>
+        <span className="cc-comment-time">{comment.created_at ? fmtDate(comment.created_at) : ''}</span>
         {comment.edited_at && <span className="cc-comment-edited">(edited)</span>}
         <span style={{ flex: 1 }} />
         <ActionButton isQuiet size="XS" aria-label="Edit comment" onPress={() => setEditing(!editing)}>

@@ -88,6 +88,11 @@ const configs = [
     jsx: 'automatic',
     jsxImportSource: 'react',
     plugins: [macroPlugin, localePlugin],
+    // S2's vendored TableView.css ships an empty `:has()` selector that esbuild
+    // flags as a CSS syntax error (still present as of S2 1.5.1). It's in a
+    // component we don't use and can't be patched in node_modules — silence just
+    // this warning for this build.
+    logOverride: { 'css-syntax-error': 'silent' },
   },
 ];
 
