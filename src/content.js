@@ -28,7 +28,17 @@ if (window.__chitChatLoaded) {
   // ── Helpers ──────────────────────────────────────────────────────────────
 
   function send(type, payload = {}) {
-    return chrome.runtime.sendMessage({ type, ...payload });
+    // After the extension is reloaded/updated, this content script keeps running
+    // but its chrome.* bridge is invalidated (chrome.runtime.id becomes
+    // undefined) — calling sendMessage would throw synchronously. Bail quietly,
+    // and swallow async rejections (e.g. no receiver) so fire-and-forget callers
+    // like toPanel never produce uncaught errors.
+    if (!chrome.runtime?.id) return Promise.resolve();
+    try {
+      return chrome.runtime.sendMessage({ type, ...payload }).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
   }
 
   /** postMessage-safe wrapper to tell the panel something. */
@@ -158,7 +168,11 @@ if (window.__chitChatLoaded) {
         const score = textSimilarity(el.textContent, textContent);
         if (score > bestScore) { bestScore = score; best = el; }
       }
-      if (best && bestScore >= 0.5) return { element: best, status: bestScore >= 0.8 ? 'resolved' : 'approximate' };
+      // Cap at 'approximate': we reached the tag-wide text scan only because the
+      // structural (CSS/XPath) match failed its text check, so a text-only hit
+      // among possibly-identical siblings must not be reported as a confident
+      // 'resolved' — that would place the marker on the wrong element silently.
+      if (best && bestScore >= 0.5) return { element: best, status: 'approximate' };
     }
     return { element: null, status: 'unanchored' };
   }
@@ -233,7 +247,7 @@ if (window.__chitChatLoaded) {
          shadow root so the host page's CSS can't bleed into the dialog) */
       #cc-compose { position: fixed; background: #fff; border-radius: 8px;
                     box-shadow: 0 8px 32px rgba(0,0,0,.2); padding: 12px;
-                    z-index: 2147483644; width: 320px; box-sizing: border-box;
+                    z-index: 2147483644; width: 380px; box-sizing: border-box;
                     color: #1b1b1b; font: 13px/1.5 -apple-system, sans-serif; }
       #cc-compose.cc-dark { background: #2b2b2b; color: #eee;
                              box-shadow: 0 8px 32px rgba(0,0,0,.5); }
@@ -247,16 +261,20 @@ if (window.__chitChatLoaded) {
   // selectors from matching at all. `:host(.cc-dark)` mirrors the panel's
   // light/dark toggle (synced via chrome.storage.sync, see _theme).
   const COMPOSE_SHADOW_CSS = `
-    textarea { display: block; width: 100%; min-height: 80px; box-sizing: border-box;
+    textarea { display: block; width: 100%; min-height: 120px; max-height: 45vh;
+               box-sizing: border-box; overflow-y: auto;
                border: 1px solid #ccc; border-radius: 4px; padding: 8px;
                font: 13px/1.5 -apple-system, sans-serif; color: #1b1b1b; background: #fff;
                resize: vertical; outline-color: #0265DC; }
+    .cc-compose-hint { margin-top: 6px; font: 11px/1.4 -apple-system, sans-serif;
+                       color: #6d6d6d; }
     .cc-compose-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
     button { padding: 6px 14px; border-radius: 4px; border: 1px solid #ccc;
              cursor: pointer; font: 13px/1 -apple-system, sans-serif; color: #1b1b1b; background: #fff; }
     .cc-compose-save { background: #0265DC; color: #fff; border-color: #0265DC; }
     .cc-compose-cancel { background: #fff; color: #1b1b1b; }
     :host(.cc-dark) textarea { background: #1e1e1e; border-color: #555; color: #eee; }
+    :host(.cc-dark) .cc-compose-hint { color: #aaa; }
     :host(.cc-dark) button { background: #3a3a3a; border-color: #555; color: #eee; }
     :host(.cc-dark) .cc-compose-save { background: #0265DC; border-color: #0265DC; color: #fff; }
     :host(.cc-dark) .cc-compose-cancel { background: #3a3a3a; color: #eee; }
@@ -418,7 +436,10 @@ if (window.__chitChatLoaded) {
     }
     for (const shape of overlay.querySelectorAll('.cc-shape')) {
       const tid = shape.dataset.threadId;
-      const t = _threads.find((x) => x.id === tid);
+      // dataset values are always strings; stringify the id so numeric backend
+      // ids still match (otherwise shapes freeze at their initial position on
+      // scroll while dot markers — which look up by object key — track fine).
+      const t = _threads.find((x) => String(x.id) === tid);
       if (!t?.anchor) continue;
       const a = t.anchor;
       shape.style.left = `${a.left - window.scrollX}px`;
@@ -459,7 +480,6 @@ if (window.__chitChatLoaded) {
   // ── Annotation mode ────────────────────────────────────────────────────────
 
   let _mode = null; // null | 'element' | 'rect' | 'ellipse'
-  let _pendingAnchorContext = null; // { el, selection } set during compose
 
   function setMode(mode) {
     _mode = mode;
@@ -546,17 +566,32 @@ if (window.__chitChatLoaded) {
     const cleanup = () => {
       document.removeEventListener('keydown', onMenuKey, true);
       document.removeEventListener('mousedown', onMenuOutside, true);
+      document.removeEventListener('contextmenu', onMenuContext, true);
     };
-    const onMenuKey = (ev) => {
-      if (ev.key === 'Escape') { menu.remove(); hideHighlight(); cleanup(); }
+    // Tear the menu + highlight overlay down together on every exit, so nothing
+    // is left half-armed. openCompose (on pick) clears _mode + notifies the
+    // panel itself; the dismiss/cancel paths do it via cancel().
+    const closeMenu = () => {
+      menu.remove();
+      hideHighlight();
+      cleanup();
+      stopElementPicker();
     };
+    const cancel = () => { closeMenu(); _mode = null; toPanel('cc:panel:modeCancelled', {}); };
+    const onMenuKey = (ev) => { if (ev.key === 'Escape') cancel(); };
+    // Right-click cancels and suppresses the native menu — consistent with the
+    // picker/shape tools. contextmenu fires AFTER mousedown, so onMenuOutside
+    // must ignore right-clicks (button 2) or it would tear down first and let
+    // the native menu through.
+    const onMenuContext = (ev) => { ev.preventDefault(); cancel(); };
     const onMenuOutside = (ev) => {
-      if (!menu.contains(ev.target)) { menu.remove(); hideHighlight(); cleanup(); }
+      if (ev.button === 2) return;
+      if (!menu.contains(ev.target)) cancel();
     };
 
     root.querySelectorAll('.cc-picker-item').forEach((li, i) => {
       li.addEventListener('click', () => {
-        menu.remove(); hideHighlight(); cleanup();
+        closeMenu();
         openCompose(items[i], null, x, y);
       });
       li.addEventListener('mouseenter', () => highlightPickerEl(items[i]));
@@ -564,10 +599,16 @@ if (window.__chitChatLoaded) {
     });
 
     document.addEventListener('keydown', onMenuKey, true);
+    document.addEventListener('contextmenu', onMenuContext, true);
     setTimeout(() => document.addEventListener('mousedown', onMenuOutside, true), 0);
   }
 
-  function startElementPicker() {
+  // Just the hover-highlight overlay, no global listeners. Shared by the full
+  // picker and by the disambiguation menu — the menu owns its own interaction
+  // and must NOT have the picker's page-level click/contextmenu handlers armed
+  // (otherwise a right-click's mousedown tears the picker down before its
+  // contextmenu handler can suppress the native menu).
+  function ensureHighlightOverlay() {
     if (_pickerEl) return;
     _pickerEl = document.createElement('div');
     _pickerEl.id = 'cc-element-picker';
@@ -580,11 +621,16 @@ if (window.__chitChatLoaded) {
     _tagEl.className = 'cc-el-tag';
     _highlightEl.appendChild(_tagEl);
     _pickerEl.appendChild(_highlightEl);
+  }
 
+  function startElementPicker() {
+    if (_pickerEl) return;
+    ensureHighlightOverlay();
     document.body.style.cursor = 'crosshair';
     document.addEventListener('mousemove', onPickerMove, { capture: true });
     document.addEventListener('click', onPickerClick, { capture: true });
     document.addEventListener('keydown', onPickerKey, { capture: true });
+    document.addEventListener('contextmenu', onPickerContext, { capture: true });
   }
 
   function stopElementPicker() {
@@ -594,18 +640,15 @@ if (window.__chitChatLoaded) {
     document.removeEventListener('mousemove', onPickerMove, { capture: true });
     document.removeEventListener('click', onPickerClick, { capture: true });
     document.removeEventListener('keydown', onPickerKey, { capture: true });
+    document.removeEventListener('contextmenu', onPickerContext, { capture: true });
   }
 
-  let _pickerTarget = null;
-  let _pickerCandidates = [];
   function onPickerMove(e) {
     const candidates = getPickerCandidates(e.clientX, e.clientY);
     // Prefer non-canvas/video as the hover target (mirrors milo).
     const el = candidates.find((c) => c.tagName !== 'CANVAS' && c.tagName !== 'VIDEO')
       || candidates[0];
-    if (!el) return;
-    _pickerTarget = el;
-    _pickerCandidates = candidates;
+    if (!el) { hideHighlight(); return; }
     highlightPickerEl(el);
   }
 
@@ -620,8 +663,8 @@ if (window.__chitChatLoaded) {
     if (candidates.length === 1) {
       openCompose(candidates[0], null, e.clientX, e.clientY);
     } else {
-      // Re-show picker overlay briefly for the menu hover highlights.
-      startElementPicker();
+      // Only the highlight overlay — the menu owns its own interaction.
+      ensureHighlightOverlay();
       showElementPicker(candidates, e.clientX, e.clientY);
     }
   }
@@ -633,6 +676,15 @@ if (window.__chitChatLoaded) {
       _mode = null;
       toPanel('cc:panel:modeCancelled', {});
     }
+  }
+
+  // Right-click exits the picker (same as ESC); suppress the native menu.
+  function onPickerContext(e) {
+    e.preventDefault();
+    document.getElementById('cc-picker-menu')?.remove();
+    stopElementPicker();
+    _mode = null;
+    toPanel('cc:panel:modeCancelled', {});
   }
 
   // ── Shape draw ─────────────────────────────────────────────────────────────
@@ -650,6 +702,7 @@ if (window.__chitChatLoaded) {
     document.body.appendChild(_drawLayer);
     _drawLayer.addEventListener('mousedown', onDrawStart);
     document.addEventListener('keydown', onDrawKey, { capture: true });
+    document.addEventListener('contextmenu', onDrawContext, { capture: true });
   }
 
   function stopShapeDraw() {
@@ -658,6 +711,7 @@ if (window.__chitChatLoaded) {
     document.removeEventListener('mousemove', onDrawMove, { capture: true });
     document.removeEventListener('mouseup', onDrawEnd, { capture: true });
     document.removeEventListener('keydown', onDrawKey, { capture: true });
+    document.removeEventListener('contextmenu', onDrawContext, { capture: true });
     _drawStart = null; _drawShape = null;
   }
 
@@ -697,7 +751,6 @@ if (window.__chitChatLoaded) {
       left: Math.round(x), top: Math.round(y),
       width: Math.round(width), height: Math.round(height),
     };
-    const currentShape = _drawShape;
     stopShapeDraw();
     _mode = null;
     openComposeWithAnchor(anchor, e.clientX, e.clientY);
@@ -707,14 +760,20 @@ if (window.__chitChatLoaded) {
     if (e.key === 'Escape') { stopShapeDraw(); _mode = null; toPanel('cc:panel:modeCancelled', {}); }
   }
 
+  // Right-click exits shape-draw (same as ESC); suppress the native menu.
+  function onDrawContext(e) {
+    e.preventDefault();
+    stopShapeDraw();
+    _mode = null;
+    toPanel('cc:panel:modeCancelled', {});
+  }
+
   // ── Text selection button ──────────────────────────────────────────────────
 
   let _selBtn = null;
-  let _selRange = null;
 
   function removeSelBtn() {
     if (_selBtn) { _selBtn.remove(); _selBtn = null; }
-    _selRange = null;
   }
 
   document.addEventListener('selectionchange', () => {
@@ -757,13 +816,19 @@ if (window.__chitChatLoaded) {
 
   function openComposeWithAnchor(anchor, cx, cy) {
     closeCompose();
+    // The selection tool has done its job once a target is chosen and we're
+    // composing — clear the mode and tell the panel so its tool toggle
+    // deselects. (Tools are single-shot; this fires for element/shape/text-
+    // selection paths alike since they all funnel through here.)
+    _mode = null;
+    toPanel('cc:panel:modeCancelled', {});
     const pop = document.createElement('div');
     pop.id = 'cc-compose';
     if (_theme === 'dark') pop.classList.add('cc-dark');
 
     // Position: prefer right/below the cursor, flip if too close to edge
     const W = window.innerWidth; const H = window.innerHeight;
-    const pw = 320; const ph = 150;
+    const pw = 380; const ph = 240;
     const left = cx + pw > W - 8 ? cx - pw : cx + 8;
     const top = cy + ph > H - 8 ? cy - ph : cy + 8;
     pop.style.left = `${left}px`;
@@ -778,8 +843,29 @@ if (window.__chitChatLoaded) {
     root.appendChild(style);
 
     const textarea = document.createElement('textarea');
-    textarea.placeholder = 'Leave a comment…';
+    textarea.placeholder = 'Leave a comment… write as much as you need.';
     root.appendChild(textarea);
+
+    // Grow with content up to the CSS max-height (45vh), then the textarea's
+    // own scrollbar takes over — comfortable for long, multi-paragraph feedback.
+    // The popover's top was placed once from the initial size estimate, so after
+    // growing, nudge it up if the taller box would spill past the viewport bottom.
+    const autoGrow = () => {
+      textarea.style.height = 'auto';
+      const cap = Math.round(window.innerHeight * 0.45);
+      textarea.style.height = `${Math.min(textarea.scrollHeight, cap)}px`;
+      const rect = pop.getBoundingClientRect();
+      const margin = 8;
+      if (rect.bottom > window.innerHeight - margin) {
+        pop.style.top = `${Math.max(margin, window.innerHeight - margin - rect.height)}px`;
+      }
+    };
+    textarea.addEventListener('input', autoGrow);
+
+    const hint = document.createElement('p');
+    hint.className = 'cc-compose-hint';
+    hint.textContent = 'Enter for a new line · ⌘/Ctrl+Enter to post';
+    root.appendChild(hint);
 
     const actions = document.createElement('div');
     actions.className = 'cc-compose-actions';
@@ -826,7 +912,10 @@ if (window.__chitChatLoaded) {
 
   // ── SPA navigation + MutationObserver ─────────────────────────────────────
 
-  let _lastUrl = window.location.href;
+  // Track origin+pathname (NOT full href) so it matches what onPageNavigated
+  // compares against — otherwise the first nav event on a page with a query
+  // string or hash would look like a navigation and wipe the markers.
+  let _lastUrl = window.location.origin + window.location.pathname;
 
   function onPageNavigated() {
     const url = window.location.origin + window.location.pathname;
@@ -846,9 +935,21 @@ if (window.__chitChatLoaded) {
   window.addEventListener('popstate', onPageNavigated);
   window.addEventListener('hashchange', onPageNavigated);
 
+  // Was this mutation caused by our own overlay/dialogs rather than page content?
+  // Skip those so rendering markers / opening compose doesn't schedule a
+  // needless re-resolution pass. (We only observe childList, so it's enough to
+  // check the mutated container and the added/removed nodes.)
+  function isOwnMutation(m) {
+    if (isOwnUi(m.target)) return true;
+    const nodes = [...m.addedNodes, ...m.removedNodes];
+    return nodes.length > 0
+      && nodes.every((n) => n.nodeType === Node.ELEMENT_NODE && isOwnUi(n));
+  }
+
   // MutationObserver: re-resolve orphaned anchors when DOM changes
   let _mutationTimer = null;
-  const mo = new MutationObserver(() => {
+  const mo = new MutationObserver((mutations) => {
+    if (mutations.every(isOwnMutation)) return;
     clearTimeout(_mutationTimer);
     _mutationTimer = setTimeout(() => {
       if (!_threads.length) return;

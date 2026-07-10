@@ -313,6 +313,23 @@ html, body {
   flex-shrink: 0;
 }
 
+.cc-reply-hint {
+  font-size: 11px;
+  opacity: 0.6;
+  margin-top: 6px;
+}
+
+/*
+ * S2 TextArea auto-grows by writing an inline height = scrollHeight. In this
+ * fixed-height panel an unbounded reply/edit box would crush the content above
+ * it, so cap growth with max-height (which wins over the inline height) and let
+ * the native textarea scrollbar take over for very long, multi-paragraph input.
+ */
+.cc-reply-area textarea,
+.cc-comment-block textarea {
+  max-height: 40vh;
+}
+
 .cc-reply-actions {
   display: flex;
   justify-content: flex-end;

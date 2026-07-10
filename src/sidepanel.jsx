@@ -65,13 +65,6 @@ async function toContent(tabId, type, payload = {}) {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-// Kept for completeness; comment bodies are rendered as text nodes so XSS isn't a concern.
-function escHtml(str) {
-  return String(str ?? '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
 function relTime(iso) {
   const diff = (Date.now() - new Date(iso)) / 1000;
   if (diff < 60) return 'just now';
@@ -125,14 +118,15 @@ async function setMyVote(commentId, v) {
   return storage.set(`vote:${commentId}`, v);
 }
 
+// Extract plain text from a (possibly HTML) comment body — milo stores Quill
+// rich text, so bodies can contain markup. Parse with DOMParser rather than
+// assigning innerHTML on a live-document element: a DOMParser document has no
+// browsing context, so embedded resources (e.g. `<img src>`) never load and no
+// beacon fires while we're only reading textContent.
 function stripHtml(html) {
   if (!html) return '';
-  const el = document.createElement('div');
-  el.innerHTML = html;
-  return el.textContent ?? '';
+  return new DOMParser().parseFromString(html, 'text/html').body.textContent ?? '';
 }
-
-const STATUSES = ['open', 'in_progress', 'resolved'];
 
 // Human-readable status label. Undefined/null is treated as 'open'.
 function statusLabel(status) {
@@ -147,6 +141,23 @@ function statusBadgeVariant(status) {
   if (status === 'in_progress') return 'informative';
   if (status === 'resolved') return 'positive';
   return 'notice'; // 'open' or undefined
+}
+
+// The author_name we stamp on comments this user creates — single source of
+// truth shared by comment creation and the ownership guard below.
+function myAuthorName(profile) {
+  return profile?.name ?? profile?.email ?? null;
+}
+
+// Frontend-only ownership check. The backend stores author_id as NULL and does
+// NOT enforce ownership (edit/delete are open to anyone with the id), so this
+// is a best-effort UI guard matched on display name: it hides edit/delete for
+// comments that aren't the current user's. Limitations: identical display names
+// collide, and a changed profile name orphans a user from their old comments.
+// This is a courtesy guard, not a security boundary.
+function isMyComment(comment, profile) {
+  const me = myAuthorName(profile);
+  return !!me && comment?.author_name === me;
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -165,15 +176,36 @@ function App() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [sessionExpired, setSessionExpired] = useState(false);
   const [avatarFailed, setAvatarFailed] = useState(false);
   const pollRef = useRef(null);
+  // The message listener is registered once (stable), but handleNewThread closes
+  // over auth/state that change across renders. Route through a ref so the
+  // listener always calls the latest closure instead of the first render's
+  // (whose auth.profile is still null) — otherwise new threads' first comments
+  // would be authored as null. See the onMsg effect.
+  const handleNewThreadRef = useRef(null);
+  // Latest active pageUrl, and the URL the current `threads` were fetched for.
+  // Used to drop stale in-flight fetches and to avoid pushing one page's threads
+  // onto another page's tab. Kept as refs so the fetch callback (stable) and the
+  // push effect can read current values without extra deps.
+  const pageUrlRef = useRef('');
+  const threadsUrlRef = useRef(null);
+  // Bumped on every optimistic local mutation (reply/edit/delete/vote/status).
+  // A fetch that started before a bump is dropped on arrival so an older
+  // in-flight poll can't clobber the optimistic state.
+  const mutationSeqRef = useRef(0);
 
   // ── Theme ────────────────────────────────────────────────────────────────
+  // Guard the persist write so it doesn't fire with the default 'light' before
+  // the stored theme has loaded (which would depend on chrome.storage FIFO
+  // ordering to not overwrite the user's saved choice).
+  const themeHydrated = useRef(false);
   useEffect(() => {
-    storage.get('theme').then(t => { if (t) setTheme(t); });
+    storage.get('theme').then(t => { if (t) setTheme(t); themeHydrated.current = true; });
   }, []);
   useEffect(() => {
-    storage.set('theme', theme);
+    if (themeHydrated.current) storage.set('theme', theme);
   }, [theme]);
 
   // ── Auth ─────────────────────────────────────────────────────────────────
@@ -224,56 +256,101 @@ function App() {
       }
     });
 
-    chrome.tabs.onActivated.addListener(({ tabId: tid, windowId: wid }) => {
+    // Named handlers so they can be removed on cleanup (avoids duplicate
+    // listeners under React StrictMode's dev double-invoke).
+    function onActivated({ tabId: tid, windowId: wid }) {
       // Only track activations in the same window as the side panel
       if (panelWindowIdRef.current !== null && wid !== panelWindowIdRef.current) return;
       chrome.tabs.get(tid, applyTab);
-    });
-    chrome.tabs.onUpdated.addListener((tid, info) => {
+    }
+    function onUpdated(tid, info) {
       if (info.status === 'complete' && panelWindowIdRef.current !== null) {
         chrome.tabs.query({ active: true, windowId: panelWindowIdRef.current }, (ts) => {
           if (ts[0]?.id === tid) chrome.tabs.get(tid, applyTab);
         });
       }
-    });
+    }
+    chrome.tabs.onActivated.addListener(onActivated);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    return () => {
+      chrome.tabs.onActivated.removeListener(onActivated);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+    };
   }, []);
 
   // ── Fetch threads ─────────────────────────────────────────────────────────
-  const fetchThreads = useCallback(async (url, { silent = false } = {}) => {
+  // background: true marks the 10s poll. It tells the SW not to open an
+  // interactive sign-in popup on an expired token — instead the request fails
+  // with SESSION_EXPIRED and we show a non-destructive re-sign-in banner,
+  // keeping the current view (and any unsent draft) mounted.
+  const fetchThreads = useCallback(async (url, { silent = false, background = false } = {}) => {
     if (!url) return;
+    const seqAtStart = mutationSeqRef.current;
     if (!silent) { setLoading(true); setError(null); }
     try {
-      const data = await sw('cc:api:fetchThreads', { pageUrl: url });
-      setThreads(data?.threads ?? data ?? []);
-      refreshAuth(); // token may have been acquired implicitly by ensureToken — sync state
+      const data = await sw('cc:api:fetchThreads', { pageUrl: url, background });
+      // Ignore a response that lost its race: the active page changed while in
+      // flight (a later fetch owns the UI now), or a local mutation landed
+      // (don't clobber the optimistic state with a pre-mutation snapshot).
+      if (url !== pageUrlRef.current || mutationSeqRef.current !== seqAtStart) return;
+      const list = data?.threads ?? data ?? [];
+      threadsUrlRef.current = url;
+      setThreads(Array.isArray(list) ? list : []);
+      setSessionExpired(false); // any successful fetch means the session is healthy again
+      if (!silent) refreshAuth(); // sync auth only on user-initiated fetches (not every 10s poll)
     } catch (err) {
-      if (err.message?.includes('401') || err.message?.includes('auth')) {
+      if (err.message === 'SESSION_EXPIRED') {
+        // Don't tear down the UI or setError — just surface the banner.
+        setSessionExpired(true);
+      } else if (err.message?.includes('401') || err.message?.includes('auth')) {
         setAuth({ signedIn: false, profile: null });
-      } else {
-        if (!silent) setError(err.message);
+      } else if (!silent) {
+        setError(err.message);
       }
     } finally {
       if (!silent) setLoading(false);
     }
   }, [refreshAuth]);
 
+  // Drop the previous page's threads the instant the URL changes (tab switch to
+  // a different page, or same-tab SPA navigation), so stale threads aren't shown
+  // in the list — or pushed onto the new page as stray markers — before the new
+  // fetch resolves. Keyed on pageUrl, not tabId: threads are per-URL on the
+  // server, so switching between two tabs on the *same* URL must NOT clear (and
+  // wouldn't refetch, since the fetch effect is also keyed on pageUrl).
+  useEffect(() => {
+    pageUrlRef.current = pageUrl;
+    setThreads([]); setResolution({});
+  }, [pageUrl]);
+
   // Re-fetch when URL changes or sign-in state changes (so threads load immediately after sign-in)
   useEffect(() => { if (pageUrl && auth.signedIn) fetchThreads(pageUrl); }, [pageUrl, auth.signedIn, fetchThreads]);
 
-  // Poll every 10s (pause when doc hidden or signed out); silent so no spinner flash
+  // Poll every 10s (pause when doc hidden or signed out); silent so no spinner flash.
+  // Also refresh immediately when the panel becomes visible again, so returning
+  // to it doesn't show up-to-10s-stale threads.
   useEffect(() => {
     if (!pageUrl || !auth.signedIn) return;
-    const tick = () => { if (!document.hidden) fetchThreads(pageUrl, { silent: true }); };
-    pollRef.current = setInterval(tick, 10_000);
-    return () => clearInterval(pollRef.current);
+    const refresh = () => { if (!document.hidden) fetchThreads(pageUrl, { silent: true, background: true }); };
+    pollRef.current = setInterval(refresh, 10_000);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      clearInterval(pollRef.current);
+      document.removeEventListener('visibilitychange', refresh);
+    };
   }, [pageUrl, auth.signedIn, fetchThreads]);
 
   // ── Push threads to content script overlay ────────────────────────────────
+  // Only push when the current threads actually belong to the active page. On a
+  // tab switch to a different URL, this effect can run once with the new tabId
+  // but the previous page's threads still in state; pushing then would flash the
+  // old page's markers on the new tab. threadsUrlRef is set in fetchThreads to
+  // the URL the threads were fetched for.
   useEffect(() => {
-    if (tabId !== null && threads.length >= 0) {
+    if (tabId !== null && threadsUrlRef.current === pageUrl) {
       toContent(tabId, 'cc:content:threads', { threads }).catch(() => {});
     }
-  }, [threads, tabId]);
+  }, [threads, tabId, pageUrl]);
 
   // ── Incoming messages from content script (via SW broadcast) ─────────────
   useEffect(() => {
@@ -288,7 +365,7 @@ function App() {
           setActiveId(p.threadId); setView('detail');
         }
         if (p.type === 'cc:panel:anchorCaptured') {
-          handleNewThread(p.pageUrl, p.anchor, p.body);
+          handleNewThreadRef.current?.(p.pageUrl, p.anchor, p.body);
         }
         if (p.type === 'cc:panel:resolutionUpdated') {
           setResolution(p.resolution ?? {});
@@ -308,14 +385,20 @@ function App() {
   // the page. Mirror that cancel here for panel-focused ESC.
   useEffect(() => {
     if (!mode) return undefined;
-    function onKey(e) {
-      if (e.key === 'Escape') {
-        setModeState(null);
-        if (tabId) toContent(tabId, 'cc:content:mode', { mode: null }).catch(() => {});
-      }
-    }
+    const cancel = () => {
+      setModeState(null);
+      if (tabId) toContent(tabId, 'cc:content:mode', { mode: null }).catch(() => {});
+    };
+    function onKey(e) { if (e.key === 'Escape') cancel(); }
+    // Right-click inside the panel also cancels the active tool (and suppresses
+    // the panel's own context menu), matching the on-page picker/shape tools.
+    function onContext(e) { e.preventDefault(); cancel(); }
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('contextmenu', onContext);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('contextmenu', onContext);
+    };
   }, [mode, tabId]);
 
   // ── Auto-scroll to the annotated element when a thread is opened ───────────
@@ -329,16 +412,28 @@ function App() {
 
   // ── Handlers ─────────────────────────────────────────────────────────────
   async function handleNewThread(url, anchor, body) {
+    let created = null;
     try {
       const thread = await sw('cc:api:createThread', { pageUrl: url, anchor });
+      created = thread;
       if (thread && body) {
-        const authorName = auth.profile?.name ?? auth.profile?.email;
+        const authorName = myAuthorName(auth.profile);
         await sw('cc:api:createComment', { threadId: thread.id, body, authorName });
       }
       await fetchThreads(url);
       if (thread) { setActiveId(thread.id); setView('detail'); }
-    } catch (err) { setError(err.message); }
+    } catch (err) {
+      // The thread and its first comment aren't created atomically: if the
+      // comment call fails after the thread was created, roll the thread back so
+      // we don't leave an empty "(no comments)" thread (and a stray on-page dot).
+      if (created?.id) {
+        try { await sw('cc:api:deleteThread', { id: created.id }); } catch { /* best effort */ }
+      }
+      setError(`Couldn't save your comment — ${err.message}`);
+    }
   }
+  // Keep the ref pointing at the current-render closure (fresh auth/state).
+  handleNewThreadRef.current = handleNewThread;
 
   function toggleMode(m) {
     const next = mode === m ? null : m;
@@ -349,6 +444,7 @@ function App() {
   async function signIn() {
     try {
       await sw('cc:auth:signIn');
+      setSessionExpired(false); // fresh token — clear any expiry banner
       await refreshAuth(); // sets auth.signedIn → true
       // Immediately fetch threads for the current page rather than relying solely
       // on the effect (which won't re-fire if pageUrl didn't change).
@@ -379,10 +475,13 @@ function App() {
 
   function exportJson() {
     const blob = new Blob([JSON.stringify({ pageUrl, threads }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
+    a.href = url;
     a.download = `chit-chat-${(pageUrl || 'export').replace(/[^a-z0-9]/gi, '_')}.json`;
     a.click();
+    // Release the blob once the download has kicked off (next tick is enough).
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
   const filteredThreads = threads.filter((t) => {
@@ -464,6 +563,18 @@ function App() {
         </div>
       )}
 
+      {/* Session-expiry banner — non-destructive: the view (and any unsent
+          draft) stays mounted; re-sign-in is a single click and the next
+          successful fetch clears it. */}
+      {auth.signedIn && sessionExpired && (
+        <div className="cc-error-row">
+          <InlineAlert variant="notice" UNSAFE_style={{ flex: 1 }}>
+            <Heading>Your session expired</Heading>
+          </InlineAlert>
+          <Button variant="accent" size="S" onPress={signIn}>Sign in</Button>
+        </div>
+      )}
+
       {auth.signedIn ? (
         view === 'list'
           ? <ThreadList
@@ -484,14 +595,21 @@ function App() {
               pageUrl={pageUrl}
               auth={auth}
               onBack={() => { setView('list'); setActiveId(null); }}
-              onUpdate={(updated) => setThreads(ts => ts.map(t => t.id === updated.id ? updated : t))}
+              onUpdate={(updated) => {
+                // Optimistic mutation — mark it so an older in-flight poll can't
+                // revert it (see fetchThreads' mutationSeq guard).
+                mutationSeqRef.current += 1;
+                setThreads(ts => ts.map(t => t.id === updated.id ? updated : t));
+              }}
               onDelete={() => {
+                mutationSeqRef.current += 1;
                 setThreads(ts => ts.filter(t => t.id !== activeId));
                 setView('list'); setActiveId(null);
               }}
               onScrollTo={() => {
                 if (tabId && activeThread) toContent(tabId, 'cc:content:scrollTo', { threadId: activeId }).catch(() => {});
               }}
+              onError={setError}
             />
       ) : (
         <div className="cc-signed-out">
@@ -619,9 +737,10 @@ function ThreadCard({ thread, resolution, onClick }) {
 
 // ── Thread detail ─────────────────────────────────────────────────────────────
 
-function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpdate, onDelete, onScrollTo }) {
+function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpdate, onDelete, onScrollTo, onError }) {
   const [replyText, setReplyText] = useState('');
   const [posting, setPosting] = useState(false);
+  const commentsRef = useRef(null);
 
   if (!thread) {
     // activeId is only ever set once the thread exists, so a missing thread
@@ -643,28 +762,59 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
     try {
       const updated = await sw('cc:api:patchThread', { id: thread.id, data: { status } });
       onUpdate({ ...thread, status: updated?.status ?? status });
-    } catch (err) { console.error(err); }
+    } catch (err) { onError?.(`Couldn't update status — ${err.message}`); }
   }
 
   async function deleteThread() {
     try {
       await sw('cc:api:deleteThread', { id: thread.id });
       onDelete();
-    } catch (err) { console.error('deleteThread:', err); }
+    } catch (err) { onError?.(`Couldn't delete thread — ${err.message}`); }
+  }
+
+  // Delete a single comment. If it was the last one, the thread would be left
+  // empty, so cascade into deleting the thread and returning to the list —
+  // matches the milo reference (panel.js) and avoids orphaned "(no comments)"
+  // threads. The backend's FK cascade handles the comment rows either way; this
+  // just keeps the client state (and the on-page marker) consistent.
+  async function deleteComment(commentId) {
+    try {
+      await sw('cc:api:deleteComment', { id: commentId });
+      const remaining = (thread.comments ?? []).filter((c) => c.id !== commentId);
+      if (remaining.length === 0) {
+        await sw('cc:api:deleteThread', { id: thread.id });
+        onDelete();
+      } else {
+        onUpdate({ ...thread, comments: remaining });
+      }
+    } catch (err) { onError?.(`Couldn't delete comment — ${err.message}`); }
   }
 
   async function postReply() {
     if (!replyText.trim()) return;
     setPosting(true);
     try {
-      const authorName = auth.profile?.name ?? auth.profile?.email;
+      const authorName = myAuthorName(auth.profile);
       const comment = await sw('cc:api:createComment', { threadId: thread.id, body: replyText.trim(), authorName });
       onUpdate({ ...thread, comments: [...(thread.comments ?? []), comment] });
       setReplyText('');
-    } catch (err) { console.error(err); } finally { setPosting(false); }
+      // Bring the just-posted comment into view (comments render oldest→newest).
+      // Double rAF so the scroll runs after React has committed the new node.
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const el = commentsRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
+      }));
+    } catch (err) {
+      // Leave replyText intact so the user doesn't lose what they wrote.
+      onError?.(`Couldn't post reply — ${err.message}`);
+    } finally { setPosting(false); }
   }
 
   const isOrphaned = resolution === 'unanchored';
+  // Slack-style: only the thread's creator (author of its first comment) may
+  // delete the whole thread. Same best-effort, display-name guard as
+  // isMyComment — not a security boundary (see its note).
+  const canDeleteThread = isMyComment(thread.comments?.[0], auth.profile);
 
   return (
     <div className="cc-detail">
@@ -678,20 +828,22 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         <ActionButton isQuiet aria-label="Scroll to on page" onPress={onScrollTo} size="S">
           <TargetIcon />
         </ActionButton>
-        <DialogTrigger>
-          <ActionButton isQuiet aria-label="Delete thread" size="S">
-            <DeleteIcon />
-          </ActionButton>
-          <AlertDialog
-            variant="destructive"
-            title="Delete thread"
-            primaryActionLabel="Delete"
-            cancelLabel="Cancel"
-            onPrimaryAction={deleteThread}
-          >
-            Delete this thread and all its comments? This cannot be undone.
-          </AlertDialog>
-        </DialogTrigger>
+        {canDeleteThread && (
+          <DialogTrigger>
+            <ActionButton isQuiet aria-label="Delete thread" size="S">
+              <DeleteIcon />
+            </ActionButton>
+            <AlertDialog
+              variant="destructive"
+              title="Delete thread"
+              primaryActionLabel="Delete"
+              cancelLabel="Cancel"
+              onPrimaryAction={deleteThread}
+            >
+              Delete this thread and all its comments? This cannot be undone.
+            </AlertDialog>
+          </DialogTrigger>
+        )}
       </div>
 
       {/* Status selector */}
@@ -716,19 +868,19 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
       <Divider size="S" />
 
       {/* Comments */}
-      <div className="cc-comments">
+      <div className="cc-comments" ref={commentsRef}>
         {(thread.comments ?? []).map((c) => (
           <CommentItem
             key={c.id}
             comment={c}
+            canModify={isMyComment(c, auth.profile)}
+            isLast={(thread.comments?.length ?? 0) <= 1}
             onUpdate={(updated) => onUpdate({
               ...thread,
               comments: thread.comments.map(x => x.id === updated.id ? updated : x),
             })}
-            onDelete={() => onUpdate({
-              ...thread,
-              comments: thread.comments.filter(x => x.id !== c.id),
-            })}
+            onDelete={() => deleteComment(c.id)}
+            onError={onError}
           />
         ))}
       </div>
@@ -744,6 +896,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
             width="100%"
           />
         </div>
+        <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to send</div>
         <div className="cc-reply-actions">
           <Button
             variant="accent"
@@ -761,25 +914,38 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
 
 // ── Comment item ──────────────────────────────────────────────────────────────
 
-function CommentItem({ comment, onUpdate, onDelete }) {
+function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }) {
   const [editing, setEditing] = useState(false);
+  // editText is seeded when the editor opens (see openEditor), not just at mount,
+  // so it reflects the freshest server body if a poll updated it in the meantime.
   const [editText, setEditText] = useState(comment.body ?? '');
   // Tri-state: 1 = upvoted, -1 = downvoted, 0 = not voted
   const [myVote, setMyVoteState] = useState(0);
 
   useEffect(() => { getMyVote(comment.id).then(setMyVoteState); }, [comment.id]);
 
+  // Open/close the inline editor. On open, re-seed from the current comment.body
+  // so an edit that started after a background poll doesn't begin from stale
+  // text. While the editor is open, editText persists across re-renders, so an
+  // incoming poll never clobbers what the user is typing — the React analogue of
+  // milo's guard, which simply skips re-rendering the detail view during editing.
+  function toggleEditor() {
+    if (editing) { setEditing(false); return; }
+    setEditText(comment.body ?? '');
+    setEditing(true);
+  }
+
   async function saveEdit() {
     const body = editText.trim();
     if (!body) return;
-    const updated = await sw('cc:api:patchComment', { id: comment.id, body });
-    onUpdate({ ...comment, body: updated?.body ?? body, edited_at: updated?.edited_at ?? comment.edited_at });
-    setEditing(false);
-  }
-
-  async function deleteComment() {
-    await sw('cc:api:deleteComment', { id: comment.id });
-    onDelete();
+    try {
+      const updated = await sw('cc:api:patchComment', { id: comment.id, body });
+      onUpdate({ ...comment, body: updated?.body ?? body, edited_at: updated?.edited_at ?? comment.edited_at });
+      setEditing(false);
+    } catch (err) {
+      // Keep the editor open with the user's text so the edit isn't lost.
+      onError?.(`Couldn't save edit — ${err.message}`);
+    }
   }
 
   async function vote(dir) {
@@ -789,12 +955,19 @@ function CommentItem({ comment, onUpdate, onDelete }) {
     if (prev === next) return;
     const upDelta   = (next === 1  ? 1 : 0) - (prev === 1  ? 1 : 0);
     const downDelta = (next === -1 ? 1 : 0) - (prev === -1 ? 1 : 0);
+    // Optimistic; revert both the toggle and the stored vote if the call fails.
     setMyVoteState(next);
     await setMyVote(comment.id, next);
-    const updated = await sw('cc:api:voteComment', {
-      id: comment.id, upvoteDelta: upDelta, downvoteDelta: downDelta,
-    });
-    onUpdate({ ...comment, upvotes: updated?.upvotes ?? comment.upvotes, downvotes: updated?.downvotes ?? comment.downvotes });
+    try {
+      const updated = await sw('cc:api:voteComment', {
+        id: comment.id, upvoteDelta: upDelta, downvoteDelta: downDelta,
+      });
+      onUpdate({ ...comment, upvotes: updated?.upvotes ?? comment.upvotes, downvotes: updated?.downvotes ?? comment.downvotes });
+    } catch (err) {
+      setMyVoteState(prev);
+      await setMyVote(comment.id, prev);
+      onError?.(`Couldn't record vote — ${err.message}`);
+    }
   }
 
   return (
@@ -804,25 +977,47 @@ function CommentItem({ comment, onUpdate, onDelete }) {
         <span className="cc-comment-time">{comment.created_at ? fmtDate(comment.created_at) : ''}</span>
         {comment.edited_at && <span className="cc-comment-edited">(edited)</span>}
         <span style={{ flex: 1 }} />
-        <ActionButton isQuiet size="XS" aria-label="Edit comment" onPress={() => setEditing(!editing)}>
-          <EditIcon />
-        </ActionButton>
-        <ActionButton isQuiet size="XS" aria-label="Delete comment" onPress={deleteComment}>
-          <DeleteIcon />
-        </ActionButton>
+        {/* Edit/delete are shown only for the current user's own comments — see
+            isMyComment. Not a security boundary; the backend enforces nothing. */}
+        {canModify && (
+          <>
+            <ActionButton isQuiet size="XS" aria-label="Edit comment" onPress={toggleEditor}>
+              <EditIcon />
+            </ActionButton>
+            <DialogTrigger>
+              <ActionButton isQuiet size="XS" aria-label="Delete comment">
+                <DeleteIcon />
+              </ActionButton>
+              <AlertDialog
+                variant="destructive"
+                title={isLast ? 'Delete comment and thread' : 'Delete comment'}
+                primaryActionLabel="Delete"
+                cancelLabel="Cancel"
+                onPrimaryAction={onDelete}
+              >
+                {isLast
+                  ? 'This is the only comment in this thread — deleting it also deletes the thread. This cannot be undone.'
+                  : 'Delete this comment? This cannot be undone.'}
+              </AlertDialog>
+            </DialogTrigger>
+          </>
+        )}
       </div>
 
       {editing ? (
-        <div>
+        /* ⌘/Ctrl+Enter saves — parity with the reply and compose boxes. */
+        <div onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit(); }}>
           <TextArea
             value={editText}
             onChange={setEditText}
             aria-label="Edit comment text"
             width="100%"
+            autoFocus
           />
+          <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to save</div>
           <div className="cc-edit-actions">
             <Button variant="secondary" size="S" onPress={() => setEditing(false)}>Cancel</Button>
-            <Button variant="accent" size="S" onPress={saveEdit}>Save</Button>
+            <Button variant="accent" size="S" onPress={saveEdit} isDisabled={!editText.trim()}>Save</Button>
           </div>
         </div>
       ) : (

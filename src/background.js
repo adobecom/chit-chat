@@ -158,10 +158,20 @@ async function acquireToken() {
   return pendingAuthPromise;
 }
 
-/** Get a valid token, prompting sign-in if needed. */
-async function ensureToken() {
+/**
+ * Get a valid token. For user-initiated requests (interactive = true) this
+ * prompts sign-in when there's no token. For background requests (polling) we
+ * must NOT open an auth popup unprompted, so throw a distinguishable
+ * SESSION_EXPIRED error instead and let the panel show a re-sign-in banner.
+ */
+async function ensureToken(interactive = true) {
   let token = await getToken();
   if (!token) {
+    if (!interactive) {
+      const err = new Error('SESSION_EXPIRED');
+      err.code = 'SESSION_EXPIRED';
+      throw err;
+    }
     token = await acquireToken();
     await setToken(token);
   }
@@ -170,8 +180,8 @@ async function ensureToken() {
 
 // ── Network helpers ────────────────────────────────────────────────────────
 
-async function apiRequest(path, opts = {}, retry = true) {
-  const token = await ensureToken();
+async function apiRequest(path, opts = {}, retry = true, { interactive = true } = {}) {
+  const token = await ensureToken(interactive);
   const sep = path.includes('?') ? '&' : '?';
   const url = `${API_BASE}${path}${sep}clientId=${CLIENT_ID}`;
   const controller = new AbortController();
@@ -188,14 +198,23 @@ async function apiRequest(path, opts = {}, retry = true) {
         ...(opts.headers ?? {}),
       },
     });
+  } catch (err) {
+    // Distinguish our 30s timeout from a generic network failure so the panel
+    // can show a meaningful message rather than "The operation was aborted".
+    if (err?.name === 'AbortError') throw new Error('Request timed out');
+    throw err;
   } finally {
     clearTimeout(tid);
   }
 
   if (res.status === 401 && retry) {
-    // Token expired — clear and retry once
-    await clearToken();
-    return apiRequest(path, opts, false);
+    // Token expired — clear and retry once. Preserve the interactive flag so a
+    // background poll re-acquiring a token stays silent (→ SESSION_EXPIRED)
+    // rather than popping an auth window. Only clear if the token that 401'd is
+    // still the current one: a concurrent request may have already acquired a
+    // fresh token, and blindly clearing would wipe it (→ spurious re-sign-in).
+    if (await getToken() === token) await clearToken();
+    return apiRequest(path, opts, false, { interactive });
   }
 
   if (res.status === 204) return null;
@@ -206,7 +225,11 @@ async function apiRequest(path, opts = {}, retry = true) {
     err.status = res.status;
     throw err;
   }
-  return res.json();
+  // Tolerate empty/non-JSON success bodies (e.g. a 200 PATCH with no body) —
+  // res.json() would otherwise throw "Unexpected end of JSON input".
+  const text = await res.text();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return null; }
 }
 
 // ── Message handler ────────────────────────────────────────────────────────
@@ -227,7 +250,10 @@ async function apiRequest(path, opts = {}, retry = true) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   handleMessage(msg, sender)
     .then((result) => sendResponse({ ok: true, result }))
-    .catch((err) => sendResponse({ ok: false, error: err.message }));
+    // Coerce defensively: if a non-Error is ever thrown, `err.message` would
+    // throw here and sendResponse would never fire, closing the port with an
+    // opaque "message channel closed" error instead of a useful one.
+    .catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
   return true; // keep channel open for async response
 });
 
@@ -236,7 +262,12 @@ async function handleMessage(msg, sender) {
 
   // ── API proxy ───────────────────────────────────────────────────────────
   if (type === 'cc:api:fetchThreads') {
-    return apiRequest(`/threads?page_url=${encodeURIComponent(msg.pageUrl)}`);
+    // Background polls set msg.background so an expired token surfaces as
+    // SESSION_EXPIRED instead of triggering an unprompted interactive sign-in.
+    return apiRequest(
+      `/threads?page_url=${encodeURIComponent(msg.pageUrl)}`,
+      {}, true, { interactive: !msg.background },
+    );
   }
   if (type === 'cc:api:createThread') {
     return apiRequest('/threads', {
@@ -296,7 +327,21 @@ async function handleMessage(msg, sender) {
   // ── Forward from panel → content script of a tab ──────────────────────
   // The side panel passes msg.tabId for routing.
   if (type === 'cc:tab:forward') {
-    return chrome.tabs.sendMessage(msg.tabId, msg.payload);
+    try {
+      return await chrome.tabs.sendMessage(msg.tabId, msg.payload);
+    } catch {
+      // No content script in this tab yet — this happens when the panel follows
+      // a tab switch (content.js was only injected into the originally-clicked
+      // tab) or the tab reloaded. Inject on demand and retry once. Lazy so we
+      // only ever inject into tabs the open panel is actively driving, rather
+      // than proactively into every page the user browses.
+      try {
+        await injectContentScriptOnce(msg.tabId);
+        return await chrome.tabs.sendMessage(msg.tabId, msg.payload);
+      } catch {
+        return null; // non-injectable page (chrome://, etc.) or still unavailable
+      }
+    }
   }
 
   // ── Forward from content → side panel (broadcast to extension pages) ──
@@ -343,11 +388,23 @@ async function injectContentScript(tabId) {
   });
 }
 
+// Dedup concurrent injections into the same tab: the panel can fire several
+// forwards at once on a tab switch, and two overlapping executeScript calls
+// could both run content.js before its __chitChatLoaded guard is set, wiring up
+// duplicate listeners/overlays. Collapse them into one in-flight promise.
+const _injecting = new Map(); // tabId -> Promise
+function injectContentScriptOnce(tabId) {
+  if (_injecting.has(tabId)) return _injecting.get(tabId);
+  const p = injectContentScript(tabId).finally(() => _injecting.delete(tabId));
+  _injecting.set(tabId, p);
+  return p;
+}
+
 // Re-inject content.js when the panel's tab navigates to a new page.
 chrome.tabs.onUpdated.addListener(async (tabId, info) => {
   if (tabId !== panelTabId || info.status !== 'complete') return;
   try {
-    await injectContentScript(tabId);
+    await injectContentScriptOnce(tabId);
   } catch {
     // Non-injectable page (chrome://, about:, etc.) — ignore.
   }
@@ -366,7 +423,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   // Inject the content script if it isn't already running.
   // executeScript throws on chrome://, about:, or extension pages — swallow those.
   try {
-    await injectContentScript(tab.id);
+    await injectContentScriptOnce(tab.id);
   } catch (err) {
     // Not injectable (chrome:// page, etc.) — side panel still opens, content features
     // will be unavailable. Log to service-worker console only.
