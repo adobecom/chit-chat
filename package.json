@@ -7,7 +7,8 @@
   "scripts": {
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "icons": "node scripts/make-icons.mjs"
+    "icons": "node scripts/make-icons.mjs",
+    "package": "npm run build && rm -f chit-chat-extension.zip && zip -rq chit-chat-extension.zip manifest.json sidepanel.html dist icons"
   },
   "dependencies": {
     "@react-spectrum/s2": "^1.4.0",
