@@ -295,7 +295,9 @@ async function handleMessage(msg, sender) {
   if (type === 'cc:api:patchComment') {
     // mentions is omitted (not sent as []) unless the caller explicitly
     // provides it — the backend treats "field absent" as "leave unchanged"
-    // vs. "field present" as "replace", same convention as patchThread's assignee.
+    // vs. "field present" as "replace" (see updateComment in milo-logs-deploy's
+    // comments.js; the current caller always sends it, but a future caller
+    // that only edits the body shouldn't have to resend the mention list).
     const body = { body: msg.body };
     if (msg.mentions !== undefined) body.mentions = msg.mentions;
     return apiRequest(`/comments/${msg.id}`, {

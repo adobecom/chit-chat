@@ -864,8 +864,19 @@ function useMentionPicker(text, setText, mentions, setMentions) {
     setMentions((prev) => prev.filter((m) => m.email !== email));
   }
 
+  // Closes the suggestion popover without touching the mentions already
+  // picked. Callers must invoke this on every path that clears/replaces the
+  // text without going through handleKeyDown/pick — e.g. clicking a Send/Save
+  // button with the mouse, or closing and reopening an editor — otherwise a
+  // stale popover from a previous in-progress "@query" can linger.
+  function reset() {
+    setActive(null);
+    setResults([]);
+    setActiveIndex(0);
+  }
+
   return {
-    textareaRef, results, activeIndex, setActiveIndex, syncFromCaret, handleKeyDown, pick, removeMention,
+    textareaRef, results, activeIndex, setActiveIndex, syncFromCaret, handleKeyDown, pick, removeMention, reset,
   };
 }
 
@@ -1067,6 +1078,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
       onUpdate({ ...thread, comments: [...(thread.comments ?? []), comment] });
       setReplyText('');
       setReplyMentions([]);
+      mentionPicker.reset();
       // Bring the just-posted comment into view (comments render oldest→newest).
       // Double rAF so the scroll runs after React has committed the new node.
       requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -1219,6 +1231,7 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
   // the React analogue of milo's guard, which simply skips re-rendering the
   // detail view during editing.
   function toggleEditor() {
+    mentionPicker.reset();
     if (editing) { setEditing(false); return; }
     setEditText(comment.body ?? '');
     setEditMentions(comment.mentions ?? []);
@@ -1237,6 +1250,7 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
         edited_at: updated?.edited_at ?? comment.edited_at,
       });
       setEditing(false);
+      mentionPicker.reset();
     } catch (err) {
       // Keep the editor open with the user's text so the edit isn't lost.
       onError?.(`Couldn't save edit — ${err.message}`);
@@ -1329,7 +1343,7 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
           </div>
           <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to save</div>
           <div className="cc-edit-actions">
-            <Button variant="secondary" size="S" onPress={() => setEditing(false)}>Cancel</Button>
+            <Button variant="secondary" size="S" onPress={() => { setEditing(false); mentionPicker.reset(); }}>Cancel</Button>
             <Button variant="accent" size="S" onPress={saveEdit} isDisabled={!editText.trim()}>Save</Button>
           </div>
         </>
