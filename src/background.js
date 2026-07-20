@@ -287,13 +287,20 @@ async function handleMessage(msg, sender) {
   if (type === 'cc:api:createComment') {
     return apiRequest('/comments', {
       method: 'POST',
-      body: JSON.stringify({ thread_id: msg.threadId, body: msg.body, author_name: msg.authorName }),
+      body: JSON.stringify({
+        thread_id: msg.threadId, body: msg.body, author_name: msg.authorName, mentions: msg.mentions ?? [],
+      }),
     });
   }
   if (type === 'cc:api:patchComment') {
+    // mentions is omitted (not sent as []) unless the caller explicitly
+    // provides it — the backend treats "field absent" as "leave unchanged"
+    // vs. "field present" as "replace", same convention as patchThread's assignee.
+    const body = { body: msg.body };
+    if (msg.mentions !== undefined) body.mentions = msg.mentions;
     return apiRequest(`/comments/${msg.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ body: msg.body }),
+      body: JSON.stringify(body),
     });
   }
   if (type === 'cc:api:deleteComment') {
@@ -304,6 +311,15 @@ async function handleMessage(msg, sender) {
       method: 'POST',
       body: JSON.stringify({ upvoteDelta: msg.upvoteDelta ?? 0, downvoteDelta: msg.downvoteDelta ?? 0 }),
     });
+  }
+  // @-mention / assignee people-picker autocomplete — backed by the Slack
+  // workspace directory on the backend (see milo-logs-deploy/src/annotations/people.js).
+  // Fires on every keystroke (debounced) as an incidental part of typing, not
+  // a deliberate action — so like the background poll above, a stale token
+  // here should fail quietly (SESSION_EXPIRED) rather than pop an interactive
+  // sign-in window mid-keystroke.
+  if (type === 'cc:api:searchPeople') {
+    return apiRequest(`/people?q=${encodeURIComponent(msg.q ?? '')}`, {}, true, { interactive: false });
   }
 
   // ── Auth ────────────────────────────────────────────────────────────────
