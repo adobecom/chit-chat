@@ -115,6 +115,12 @@ const QuillEditor = forwardRef(function QuillEditor(
     placeholder = 'Write a comment…',
     initialHtml = '',
     onEmptyChange,
+    // Fired on every text/selection change with (plainText, caretIndex|null) —
+    // caretIndex is null when the editor has no active selection (e.g. blur).
+    // Lets @-mention autocomplete (see useMentionPicker in sidepanel.jsx) track
+    // the caret against Quill's own document instead of mirroring text into
+    // React state, which the uncontrolled-editor design above avoids.
+    onCaretChange,
     autoFocus = false,
     'aria-label': ariaLabel,
   },
@@ -143,6 +149,21 @@ const QuillEditor = forwardRef(function QuillEditor(
       if (quillRef.current) quillRef.current.focus();
       else mountRef.current?.querySelector('textarea')?.focus();
     },
+    // Mention support below is Quill-only — the plain-<textarea> fallback (used
+    // only if Quill itself fails to construct) has no equivalent, so callers
+    // see no caret updates and a picker that simply never opens in that path.
+    getSelection() {
+      return quillRef.current ? quillRef.current.getSelection() : null;
+    },
+    // Deletes the [start, end) range and inserts `text` in its place — used to
+    // swap an in-progress "@query" for the picked "@Full Name " mention.
+    replaceRange(start, end, text) {
+      const q = quillRef.current;
+      if (!q) return;
+      if (end > start) q.deleteText(start, end - start, 'user');
+      q.insertText(start, text, 'user');
+      q.setSelection(start + text.length, 0, 'silent');
+    },
   }), []);
 
   useEffect(() => {
@@ -166,7 +187,16 @@ const QuillEditor = forwardRef(function QuillEditor(
       if (ariaLabel) q.root.setAttribute('aria-label', ariaLabel);
       quillRef.current = q;
       onEmptyChange?.(q.getText().trim().length === 0);
-      q.on('text-change', () => onEmptyChange?.(q.getText().trim().length === 0));
+      q.on('text-change', () => {
+        onEmptyChange?.(q.getText().trim().length === 0);
+        onCaretChange?.(q.getText(), q.getSelection()?.index ?? null);
+      });
+      // Also fires on caret moves that don't change text (click, arrow keys) —
+      // needed so opening/closing the mention popover tracks cursor position,
+      // not just edits. Range is null on blur, which closes the popover.
+      q.on('selection-change', (range) => {
+        onCaretChange?.(q.getText(), range ? range.index : null);
+      });
       if (autoFocus) q.focus();
 
       const toolbarEl = el.querySelector('.ql-toolbar');

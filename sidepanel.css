@@ -471,3 +471,99 @@ html, body {
   justify-content: flex-end;
   margin-top: 6px;
 }
+
+/* ── @-mention picker ────────────────────────────────────────────────────── */
+
+/* Positioning anchor for the floating suggestion list below the textarea. */
+.cc-mention-compose {
+  position: relative;
+}
+
+/* Selected-mentions chip row (TagGroup) above the compose field, or below a rendered body. */
+.cc-mention-chips {
+  margin-bottom: 6px;
+}
+
+.cc-mention-popover {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin-top: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+  border-radius: 8px;
+  border: 1px solid light-dark(#e0e0e0, #444);
+  background: light-dark(#ffffff, #2c2c2c);
+  box-shadow: 0 4px 12px light-dark(rgba(0, 0, 0, 0.15), rgba(0, 0, 0, 0.5));
+  color: light-dark(#1b1b1b, #f5f5f5);
+}
+
+.cc-mention-suggestion {
+  all: unset;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  cursor: pointer;
+  color: light-dark(#1b1b1b, #f5f5f5);
+  box-sizing: border-box;
+}
+
+.cc-mention-suggestion:hover,
+.cc-mention-suggestion.is-active {
+  background: light-dark(#eaeaea, #3a3a3a);
+}
+
+.cc-mention-suggestion-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.cc-mention-suggestion-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cc-mention-suggestion-email {
+  font-size: 11px;
+  opacity: 0.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Inline "@Name" highlight inside a rendered comment body. */
+.cc-mention {
+  font-weight: 600;
+  color: light-dark(#0d5cab, #7cb3ff);
+}
+
+/* ── Thread assignee ─────────────────────────────────────────────────────── */
+
+.cc-assignee {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: light-dark(#1b1b1b, #f5f5f5);
+}
+
+.cc-assignee-label {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.cc-assignee-picker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+}

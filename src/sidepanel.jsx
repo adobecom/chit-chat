@@ -35,6 +35,9 @@ import {
   Divider,
   DialogTrigger,
   AlertDialog,
+  TagGroup,
+  Tag,
+  Avatar,
 } from '@react-spectrum/s2';
 import { sanitizeHtml, stripHtml } from './sanitize.js';
 import QuillEditor from './QuillEditor.jsx';
@@ -122,6 +125,49 @@ async function getMyVote(commentId) {
 async function setMyVote(commentId, v) {
   if (v === 0) return storage.set(`vote:${commentId}`, null);
   return storage.set(`vote:${commentId}`, v);
+}
+
+// Wraps "@Name" occurrences (matched against comment.mentions, not raw "@"
+// text) in a highlight span, operating on already-*sanitized* HTML rather than
+// plain text — comment bodies are Quill-authored HTML now, so a naive
+// string/regex pass over the markup could match inside attribute values.
+// Walking text nodes via DOMParser (no browsing context, so no embedded
+// resource ever loads/fires here) keeps the rewrite scoped to visible text.
+function highlightMentionsHtml(html, mentions) {
+  const names = [...new Set((mentions ?? []).map((m) => m.name).filter(Boolean))]
+    // Longest names first, so "@Alice Reza" isn't cut short by "@Alice" from another mention.
+    .sort((a, b) => b.length - a.length)
+    .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (!names.length || !html) return html;
+
+  const re = new RegExp(`@(?:${names.join('|')})`, 'g');
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+  let node = walker.nextNode();
+  while (node) { textNodes.push(node); node = walker.nextNode(); }
+
+  textNodes.forEach((textNode) => {
+    const text = textNode.textContent;
+    re.lastIndex = 0;
+    if (!re.test(text)) return;
+    re.lastIndex = 0;
+    const frag = doc.createDocumentFragment();
+    let lastIndex = 0;
+    let match = re.exec(text);
+    while (match) {
+      if (match.index > lastIndex) frag.appendChild(doc.createTextNode(text.slice(lastIndex, match.index)));
+      const span = doc.createElement('span');
+      span.className = 'cc-mention';
+      span.textContent = match[0];
+      frag.appendChild(span);
+      lastIndex = match.index + match[0].length;
+      match = re.exec(text);
+    }
+    if (lastIndex < text.length) frag.appendChild(doc.createTextNode(text.slice(lastIndex)));
+    textNode.replaceWith(frag);
+  });
+  return doc.body.innerHTML;
 }
 
 // Human-readable status label. Undefined/null is treated as 'open'.
@@ -731,6 +777,236 @@ function ThreadCard({ thread, resolution, onClick }) {
   );
 }
 
+// ── @-mention autocomplete ───────────────────────────────────────────────────
+// "@" opens a floating suggestion list (cc:api:searchPeople). Not an atomic
+// token — a mention is just inserted "@Name " text in the Quill editor (see
+// QuillEditor.jsx) plus an email tracked alongside it in React state, not a
+// rich-text object Quill itself understands. Shared by the reply composer
+// (ThreadDetail) and edit editor (CommentItem).
+
+const MENTION_SEARCH_DEBOUNCE_MS = 150;
+
+// Finds the in-progress "@query" ending at `caret`. Requires whitespace/
+// start-of-string before "@" (so "foo@adobe.com" doesn't trigger it), and
+// closes on a space (multi-word names must be picked from the list).
+function findMentionQuery(text, caret) {
+  if (caret == null) return null;
+  const before = text.slice(0, caret);
+  const match = before.match(/@([^\s@]*)$/);
+  if (!match) return null;
+  const start = match.index;
+  if (start > 0 && !/\s/.test(before[start - 1])) return null;
+  return { query: match[1], start };
+}
+
+// `editorRef` points at a QuillEditor instance (see QuillEditor.jsx) rather
+// than a controlled string + <textarea> ref: compose/edit boxes are now
+// uncontrolled Quill instances, so the picker tracks the caret via
+// QuillEditor's onCaretChange callback and edits the mention text in place
+// through QuillEditor's getSelection()/replaceRange() instead of doing string
+// surgery on React state.
+function useMentionPicker(editorRef, mentions, setMentions) {
+  const [active, setActive] = useState(null); // { query, start } | null
+  const [results, setResults] = useState([]);
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  // Re-derives the active @-query from the caret. Wired up as QuillEditor's
+  // onCaretChange prop, which calls this with the editor's current plain text
+  // and caret index (null when the editor has no active selection).
+  function syncFromCaret(nextText, caret) {
+    const found = findMentionQuery(nextText ?? '', caret);
+    setActive(found);
+    if (!found) setResults([]);
+  }
+
+  useEffect(() => {
+    if (!active) return undefined;
+    // Empty query (e.g. right after typing a bare "@") → skip the round trip;
+    // the backend returns [] for it anyway.
+    if (!active.query.trim()) { setResults([]); return undefined; }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const people = await sw('cc:api:searchPeople', { q: active.query });
+        if (!cancelled) { setResults(people ?? []); setActiveIndex(0); }
+      } catch {
+        if (!cancelled) setResults([]);
+      }
+    }, MENTION_SEARCH_DEBOUNCE_MS);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [active?.query, active?.start]);
+
+  function pick(person) {
+    if (!active) return;
+    const editor = editorRef.current;
+    if (!editor) return;
+    // mousedown (see MentionSuggestions) fires before blur, so the editor's
+    // selection is still live here.
+    const sel = editor.getSelection();
+    const caret = sel ? sel.index : active.start + active.query.length + 1;
+    const insertion = `@${person.name} `;
+    editor.replaceRange(active.start, caret, insertion);
+    setMentions((prev) => (
+      prev.some((m) => m.email === person.email) ? prev : [...prev, { email: person.email, name: person.name }]
+    ));
+    setActive(null);
+    setResults([]);
+  }
+
+  // Returns true if the key was consumed by list navigation (caller should preventDefault).
+  function handleKeyDown(e) {
+    if (!active || !results.length) return false;
+    if (e.key === 'ArrowDown') { setActiveIndex((i) => (i + 1) % results.length); return true; }
+    if (e.key === 'ArrowUp') { setActiveIndex((i) => (i - 1 + results.length) % results.length); return true; }
+    if (e.key === 'Enter' || e.key === 'Tab') { pick(results[activeIndex]); return true; }
+    if (e.key === 'Escape') { setActive(null); setResults([]); return true; }
+    return false;
+  }
+
+  function removeMention(email) {
+    setMentions((prev) => prev.filter((m) => m.email !== email));
+  }
+
+  // Closes the popover without touching picked mentions. Call on any dismiss
+  // path that bypasses handleKeyDown (mouse Send/Save, closing an editor).
+  function reset() {
+    setActive(null);
+    setResults([]);
+    setActiveIndex(0);
+  }
+
+  return {
+    results, activeIndex, setActiveIndex, syncFromCaret, handleKeyDown, pick, removeMention, reset,
+  };
+}
+
+function MentionSuggestions({ results, activeIndex, onPick, onHover }) {
+  if (!results.length) return null;
+  return (
+    <div className="cc-mention-popover" role="listbox" aria-label="Mention suggestions">
+      {results.map((person, i) => (
+        <button
+          type="button"
+          key={person.email}
+          role="option"
+          aria-selected={i === activeIndex}
+          className={`cc-mention-suggestion${i === activeIndex ? ' is-active' : ''}`}
+          onMouseEnter={() => onHover(i)}
+          // mousedown fires before blur, so pick()'s caret read is still valid.
+          onMouseDown={(e) => { e.preventDefault(); onPick(person); }}
+        >
+          <Avatar src={person.avatar} alt="" size={20} />
+          <span className="cc-mention-suggestion-text">
+            <span className="cc-mention-suggestion-name">{person.name}</span>
+            <span className="cc-mention-suggestion-email">{person.email}</span>
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MentionChips({ mentions, onRemove }) {
+  if (!mentions.length) return null;
+  return (
+    <TagGroup
+      aria-label="Mentioned people"
+      UNSAFE_className="cc-mention-chips"
+      items={mentions.map((m) => ({ id: m.email, ...m }))}
+      onRemove={(keys) => [...keys].forEach((email) => onRemove(email))}
+    >
+      {(item) => <Tag id={item.id}>{item.name}</Tag>}
+    </TagGroup>
+  );
+}
+
+// ── Thread assignee ──────────────────────────────────────────────────────────
+// Same Slack-directory search as @-mentions, but a standalone SearchField (no
+// caret to track). Persists via patchThread's `assignee` field — not
+// ownership-gated, unlike status.
+function AssigneePicker({ thread, onUpdate, onError }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    // Opening the picker fires this before any typing — skip the round trip
+    // on an empty query, same as the mention picker.
+    if (!query.trim()) { setResults([]); return undefined; }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const people = await sw('cc:api:searchPeople', { q: query });
+        if (!cancelled) setResults(people ?? []);
+      } catch {
+        if (!cancelled) setResults([]);
+      }
+    }, MENTION_SEARCH_DEBOUNCE_MS);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [open, query]);
+
+  async function assign(person) {
+    setSaving(true);
+    try {
+      const updated = await sw('cc:api:patchThread', { id: thread.id, data: { assignee: person?.email ?? null } });
+      onUpdate({ ...thread, assignee: updated?.assignee ?? (person ? { id: person.email, name: person.name } : null) });
+      setOpen(false);
+      setQuery('');
+      setResults([]);
+    } catch (err) {
+      onError?.(`Couldn't update assignee — ${err.message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (thread.assignee && !open) {
+    return (
+      <div className="cc-assignee">
+        <span className="cc-assignee-label">Assigned to</span>
+        <TagGroup
+          aria-label="Assignee"
+          items={[{ id: thread.assignee.id, name: thread.assignee.name }]}
+          onRemove={() => assign(null)}
+        >
+          {(item) => <Tag id={item.id}>{item.name}</Tag>}
+        </TagGroup>
+        <ActionButton isQuiet size="S" onPress={() => setOpen(true)} isDisabled={saving}>Change</ActionButton>
+      </div>
+    );
+  }
+
+  return (
+    <div className="cc-assignee">
+      {!open ? (
+        <ActionButton isQuiet size="S" onPress={() => setOpen(true)}>+ Assign</ActionButton>
+      ) : (
+        <div className="cc-assignee-picker">
+          <SearchField
+            aria-label="Search people to assign"
+            placeholder="Assign to…"
+            value={query}
+            onChange={setQuery}
+            autoFocus
+            size="S"
+          />
+          <MentionSuggestions results={results} activeIndex={-1} onPick={assign} onHover={() => {}} />
+          <ActionButton
+            isQuiet
+            size="S"
+            onPress={() => { setOpen(false); setQuery(''); setResults([]); }}
+            isDisabled={saving}
+          >
+            Cancel
+          </ActionButton>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Thread detail ─────────────────────────────────────────────────────────────
 
 function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpdate, onDelete, onScrollTo, onError }) {
@@ -738,11 +1014,13 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   // empty, to drive the Reply button's disabled state.
   const replyEditorRef = useRef(null);
   const [replyEmpty, setReplyEmpty] = useState(true);
+  const [replyMentions, setReplyMentions] = useState([]);
   const [posting, setPosting] = useState(false);
   // Field-level validation error (size guard), shown inline under the editor —
   // distinct from onError's global banner, which is reserved for API/network failures.
   const [replyError, setReplyError] = useState(null);
   const commentsRef = useRef(null);
+  const mentionPicker = useMentionPicker(replyEditorRef, replyMentions, setReplyMentions);
 
   if (!thread) {
     // activeId is only ever set once the thread exists, so a missing thread
@@ -802,10 +1080,14 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
     setPosting(true);
     try {
       const authorName = myAuthorName(auth.profile);
-      const comment = await sw('cc:api:createComment', { threadId: thread.id, body, authorName });
+      const comment = await sw('cc:api:createComment', {
+        threadId: thread.id, body, authorName, mentions: replyMentions.map((m) => m.email),
+      });
       onUpdate({ ...thread, comments: [...(thread.comments ?? []), comment] });
       editor.clear();
       setReplyEmpty(true);
+      setReplyMentions([]);
+      mentionPicker.reset();
       // Bring the just-posted comment into view (comments render oldest→newest).
       // Double rAF so the scroll runs after React has committed the new node.
       requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -813,7 +1095,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         if (el) el.scrollTop = el.scrollHeight;
       }));
     } catch (err) {
-      // Leave the editor's contents intact so the user doesn't lose what they wrote.
+      // Leave the editor's contents and picked mentions intact so the user doesn't lose what they wrote.
       onError?.(`Couldn't post reply — ${err.message}`);
     } finally { setPosting(false); }
   }
@@ -871,6 +1153,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
           <ToggleButton id="in_progress">In progress</ToggleButton>
           <ToggleButton id="resolved">Resolved</ToggleButton>
         </ToggleButtonGroup>
+        <AssigneePicker thread={thread} onUpdate={onUpdate} onError={onError} />
       </div>
 
       <Divider size="S" />
@@ -893,14 +1176,28 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         ))}
       </div>
 
-      {/* Reply compose — Cmd/Ctrl+Enter submits */}
+      {/* Reply compose — Cmd/Ctrl+Enter submits, @name opens the mention picker */}
       <div className="cc-reply-area">
-        <div onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) postReply(); }}>
+        <MentionChips mentions={replyMentions} onRemove={mentionPicker.removeMention} />
+        <div
+          className="cc-mention-compose"
+          onKeyDown={(e) => {
+            if (mentionPicker.handleKeyDown(e)) { e.preventDefault(); return; }
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) postReply();
+          }}
+        >
           <QuillEditor
             ref={replyEditorRef}
-            placeholder="Reply…"
+            placeholder="Reply… (@ to mention someone)"
             aria-label="Reply text"
             onEmptyChange={setReplyEmpty}
+            onCaretChange={mentionPicker.syncFromCaret}
+          />
+          <MentionSuggestions
+            results={mentionPicker.results}
+            activeIndex={mentionPicker.activeIndex}
+            onPick={mentionPicker.pick}
+            onHover={mentionPicker.setActiveIndex}
           />
         </div>
         <div className={`cc-reply-hint${replyError ? ' cc-reply-error' : ''}`}>
@@ -922,9 +1219,13 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
 }
 
 // Sanitized render of a comment body (milo-authored HTML may include links
-// and images). Memoized since screenshot bodies can be large base64 strings.
-function CommentBody({ body }) {
-  const safe = useMemo(() => sanitizeHtml(body ?? ''), [body]);
+// and images), with "@Name" mentions highlighted afterward. Memoized since
+// screenshot bodies can be large base64 strings.
+function CommentBody({ body, mentions }) {
+  const safe = useMemo(
+    () => highlightMentionsHtml(sanitizeHtml(body ?? ''), mentions),
+    [body, mentions],
+  );
   // A <div>, not <p> — sanitized output can itself contain block-level <p>.
   return <div className="cc-comment-body" dangerouslySetInnerHTML={{ __html: safe }} />;
 }
@@ -940,15 +1241,27 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
   // Uncontrolled Quill instance, remounted fresh each time `editing` flips
   // true, seeded from comment.body — so it reflects the latest server body.
   const editorRef = useRef(null);
+  // editMentions is (re-)seeded when the editor opens (see toggleEditor), not
+  // just at mount, so it reflects the freshest server mentions if a poll
+  // updated the comment in the meantime.
+  const [editMentions, setEditMentions] = useState(comment.mentions ?? []);
+  const mentionPicker = useMentionPicker(editorRef, editMentions, setEditMentions);
   // Tri-state: 1 = upvoted, -1 = downvoted, 0 = not voted
   const [myVote, setMyVoteState] = useState(0);
 
   useEffect(() => { getMyVote(comment.id).then(setMyVoteState); }, [comment.id]);
 
-  // While the editor is open, an incoming poll never clobbers what's being
-  // typed — the React analogue of milo's guard against mid-edit re-renders.
+  // Open/close the inline editor. On open, re-seed editMentions from the
+  // current comment.mentions (the Quill instance itself is remounted fresh
+  // from comment.body, see editorRef above) so an edit that started after a
+  // background poll doesn't begin from stale data. While the editor is open,
+  // an incoming poll never clobbers what's being typed — the React analogue
+  // of milo's guard, which simply skips re-rendering the detail view during
+  // editing.
   function toggleEditor() {
+    mentionPicker.reset();
     setEditError(null); // don't carry a stale error into the next open
+    if (!editing) setEditMentions(comment.mentions ?? []);
     setEditing((prev) => !prev);
   }
 
@@ -959,9 +1272,15 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
     const body = editor.getHtml();
     if (body.length > MAX_COMMENT_BODY_CHARS) { setEditError(BODY_TOO_LARGE_MSG); return; }
     try {
-      const updated = await sw('cc:api:patchComment', { id: comment.id, body });
-      onUpdate({ ...comment, body: updated?.body ?? body, edited_at: updated?.edited_at ?? comment.edited_at });
+      const updated = await sw('cc:api:patchComment', { id: comment.id, body, mentions: editMentions.map((m) => m.email) });
+      onUpdate({
+        ...comment,
+        body: updated?.body ?? body,
+        mentions: updated?.mentions ?? editMentions,
+        edited_at: updated?.edited_at ?? comment.edited_at,
+      });
       setEditing(false);
+      mentionPicker.reset();
     } catch (err) {
       // Keep the editor open with the user's text so the edit isn't lost.
       onError?.(`Couldn't save edit — ${err.message}`);
@@ -1025,15 +1344,31 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
       </div>
 
       {editing ? (
-        /* ⌘/Ctrl+Enter saves — parity with the reply and compose boxes. */
-        <div onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit(); }}>
-          <QuillEditor
-            ref={editorRef}
-            initialHtml={comment.body ?? ''}
-            aria-label="Edit comment text"
-            onEmptyChange={setEditEmpty}
-            autoFocus
-          />
+        <>
+          {/* ⌘/Ctrl+Enter saves — parity with the reply and compose boxes. @name opens the mention picker. */}
+          <MentionChips mentions={editMentions} onRemove={mentionPicker.removeMention} />
+          <div
+            className="cc-mention-compose"
+            onKeyDown={(e) => {
+              if (mentionPicker.handleKeyDown(e)) { e.preventDefault(); return; }
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit();
+            }}
+          >
+            <QuillEditor
+              ref={editorRef}
+              initialHtml={comment.body ?? ''}
+              aria-label="Edit comment text"
+              onEmptyChange={setEditEmpty}
+              onCaretChange={mentionPicker.syncFromCaret}
+              autoFocus
+            />
+            <MentionSuggestions
+              results={mentionPicker.results}
+              activeIndex={mentionPicker.activeIndex}
+              onPick={mentionPicker.pick}
+              onHover={mentionPicker.setActiveIndex}
+            />
+          </div>
           <div className={`cc-reply-hint${editError ? ' cc-reply-error' : ''}`}>
             {editError ?? 'Enter for a new line · ⌘/Ctrl+Enter to save'}
           </div>
@@ -1041,9 +1376,20 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
             <Button variant="secondary" size="S" onPress={toggleEditor}>Cancel</Button>
             <Button variant="accent" size="S" onPress={saveEdit} isDisabled={editEmpty}>Save</Button>
           </div>
-        </div>
+        </>
       ) : (
-        <CommentBody body={comment.body} />
+        <>
+          <CommentBody body={comment.body} mentions={comment.mentions} />
+          {comment.mentions?.length > 0 && (
+            <TagGroup
+              aria-label="Mentioned people"
+              UNSAFE_className="cc-mention-chips"
+              items={comment.mentions.map((m) => ({ id: m.email, ...m }))}
+            >
+              {(item) => <Tag id={item.id}>{item.name}</Tag>}
+            </TagGroup>
+          )}
+        </>
       )}
 
       <div className="cc-vote-row">
