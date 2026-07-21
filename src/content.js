@@ -836,8 +836,9 @@ if (window.__chitChatLoaded) {
       if (!url) return;
       editable.focus();
       restoreRange();
-      // safeMediaUrl (sanitize.js) re-validates the scheme at render time
-      // regardless — this is just so an obviously-bad scheme isn't authored.
+      // safeMediaUrl (@adobe/annotations-core/sanitize) re-validates the scheme
+      // at render time regardless — this is just so an obviously-bad scheme
+      // isn't authored.
       if (/^\s*(javascript|data|vbscript):/i.test(url)) return;
       if (window.getSelection()?.isCollapsed) {
         document.execCommand('insertHTML', false, `<a href="${url.replace(/"/g, '&quot;')}">${url.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</a>`);

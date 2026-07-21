@@ -156,14 +156,6 @@ const QuillEditor = forwardRef(function QuillEditor(
       if (quillRef.current) return quillRef.current.root.innerHTML;
       return mountRef.current?.querySelector('textarea')?.value ?? '';
     },
-    // Quill's getText() silently drops embeds (see analyzeContents above) —
-    // fine for plain callers that only care about literal typed text, but
-    // don't use this to decide "is there anything to post"; that's what
-    // onEmptyChange (embed-aware) is for.
-    getText() {
-      if (quillRef.current) return quillRef.current.getText().trim();
-      return (mountRef.current?.querySelector('textarea')?.value ?? '').trim();
-    },
     clear() {
       if (quillRef.current) quillRef.current.setText('');
       else if (mountRef.current?.querySelector('textarea')) {
