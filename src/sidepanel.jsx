@@ -739,6 +739,9 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   const replyEditorRef = useRef(null);
   const [replyEmpty, setReplyEmpty] = useState(true);
   const [posting, setPosting] = useState(false);
+  // Field-level validation error (size guard), shown inline under the editor —
+  // distinct from onError's global banner, which is reserved for API/network failures.
+  const [replyError, setReplyError] = useState(null);
   const commentsRef = useRef(null);
 
   if (!thread) {
@@ -792,9 +795,10 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   async function postReply() {
     const editor = replyEditorRef.current;
     if (!editor || !editor.getText().trim()) return;
+    setReplyError(null);
     // Store raw HTML; CommentBody sanitizes at render time (same as milo).
     const body = editor.getHtml();
-    if (body.length > MAX_COMMENT_BODY_CHARS) { onError?.(BODY_TOO_LARGE_MSG); return; }
+    if (body.length > MAX_COMMENT_BODY_CHARS) { setReplyError(BODY_TOO_LARGE_MSG); return; }
     setPosting(true);
     try {
       const authorName = myAuthorName(auth.profile);
@@ -899,7 +903,9 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
             onEmptyChange={setReplyEmpty}
           />
         </div>
-        <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to send</div>
+        <div className={`cc-reply-hint${replyError ? ' cc-reply-error' : ''}`}>
+          {replyError ?? 'Enter for a new line · ⌘/Ctrl+Enter to send'}
+        </div>
         <div className="cc-reply-actions">
           <Button
             variant="accent"
@@ -928,6 +934,9 @@ function CommentBody({ body }) {
 function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }) {
   const [editing, setEditing] = useState(false);
   const [editEmpty, setEditEmpty] = useState(false);
+  // Field-level validation error (size guard), shown inline under the editor —
+  // distinct from onError's global banner, which is reserved for API/network failures.
+  const [editError, setEditError] = useState(null);
   // Uncontrolled Quill instance, remounted fresh each time `editing` flips
   // true, seeded from comment.body — so it reflects the latest server body.
   const editorRef = useRef(null);
@@ -939,14 +948,16 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
   // While the editor is open, an incoming poll never clobbers what's being
   // typed — the React analogue of milo's guard against mid-edit re-renders.
   function toggleEditor() {
+    setEditError(null); // don't carry a stale error into the next open
     setEditing((prev) => !prev);
   }
 
   async function saveEdit() {
     const editor = editorRef.current;
     if (!editor || !editor.getText().trim()) return;
+    setEditError(null);
     const body = editor.getHtml();
-    if (body.length > MAX_COMMENT_BODY_CHARS) { onError?.(BODY_TOO_LARGE_MSG); return; }
+    if (body.length > MAX_COMMENT_BODY_CHARS) { setEditError(BODY_TOO_LARGE_MSG); return; }
     try {
       const updated = await sw('cc:api:patchComment', { id: comment.id, body });
       onUpdate({ ...comment, body: updated?.body ?? body, edited_at: updated?.edited_at ?? comment.edited_at });
@@ -1023,9 +1034,11 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
             onEmptyChange={setEditEmpty}
             autoFocus
           />
-          <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to save</div>
+          <div className={`cc-reply-hint${editError ? ' cc-reply-error' : ''}`}>
+            {editError ?? 'Enter for a new line · ⌘/Ctrl+Enter to save'}
+          </div>
           <div className="cc-edit-actions">
-            <Button variant="secondary" size="S" onPress={() => setEditing(false)}>Cancel</Button>
+            <Button variant="secondary" size="S" onPress={toggleEditor}>Cancel</Button>
             <Button variant="accent" size="S" onPress={saveEdit} isDisabled={editEmpty}>Save</Button>
           </div>
         </div>
