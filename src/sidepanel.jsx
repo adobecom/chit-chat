@@ -36,6 +36,9 @@ import {
   DialogTrigger,
   AlertDialog,
   TextArea,
+  TagGroup,
+  Tag,
+  Avatar,
 } from '@react-spectrum/s2';
 import BrightnessContrastIcon from '@react-spectrum/s2/icons/BrightnessContrast';
 import ChevronLeftIcon from '@react-spectrum/s2/icons/ChevronLeft';
@@ -126,6 +129,29 @@ async function setMyVote(commentId, v) {
 function stripHtml(html) {
   if (!html) return '';
   return new DOMParser().parseFromString(html, 'text/html').body.textContent ?? '';
+}
+
+// Highlights "@Name" substrings matched against comment.mentions (not raw
+// "@" text). Returns React children, so this stays auto-escaped.
+function renderMentionHighlights(text, mentions) {
+  const names = [...new Set((mentions ?? []).map((m) => m.name).filter(Boolean))]
+    // Longest names first, so "@Alice Reza" isn't cut short by "@Alice" from another mention.
+    .sort((a, b) => b.length - a.length)
+    .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (!names.length) return text;
+
+  const re = new RegExp(`@(?:${names.join('|')})`, 'g');
+  const parts = [];
+  let lastIndex = 0;
+  let match = re.exec(text);
+  while (match) {
+    if (match.index > lastIndex) parts.push(text.slice(lastIndex, match.index));
+    parts.push(<span className="cc-mention" key={match.index}>{match[0]}</span>);
+    lastIndex = match.index + match[0].length;
+    match = re.exec(text);
+  }
+  parts.push(text.slice(lastIndex));
+  return parts;
 }
 
 // Human-readable status label. Undefined/null is treated as 'open'.
@@ -735,12 +761,244 @@ function ThreadCard({ thread, resolution, onClick }) {
   );
 }
 
+// ── @-mention autocomplete ───────────────────────────────────────────────────
+// "@" opens a floating suggestion list (cc:api:searchPeople). Not caret-
+// anchored — S2's TextArea has no rich-text token support, so a mention is
+// just inserted text + an email tracked alongside it, not an atomic token.
+// Shared by the reply composer (ThreadDetail) and edit editor (CommentItem).
+
+const MENTION_SEARCH_DEBOUNCE_MS = 150;
+
+// Finds the in-progress "@query" ending at `caret`. Requires whitespace/
+// start-of-string before "@" (so "foo@adobe.com" doesn't trigger it), and
+// closes on a space (multi-word names must be picked from the list).
+function findMentionQuery(text, caret) {
+  if (caret == null) return null;
+  const before = text.slice(0, caret);
+  const match = before.match(/@([^\s@]*)$/);
+  if (!match) return null;
+  const start = match.index;
+  if (start > 0 && !/\s/.test(before[start - 1])) return null;
+  return { query: match[1], start };
+}
+
+function useMentionPicker(text, setText, mentions, setMentions) {
+  const textareaRef = useRef(null);
+  const [active, setActive] = useState(null); // { query, start } | null
+  const [results, setResults] = useState([]);
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  // Re-derives the active @-query from the caret; onChange only gives the new
+  // string, not a DOM event, so callers pass this after change/click/key-up.
+  function syncFromCaret(nextText = text) {
+    const el = textareaRef.current?.getInputElement?.();
+    const found = el ? findMentionQuery(nextText, el.selectionStart) : null;
+    setActive(found);
+    if (!found) setResults([]);
+  }
+
+  useEffect(() => {
+    if (!active) return undefined;
+    // Empty query (e.g. right after typing a bare "@") → skip the round trip;
+    // the backend returns [] for it anyway.
+    if (!active.query.trim()) { setResults([]); return undefined; }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const people = await sw('cc:api:searchPeople', { q: active.query });
+        if (!cancelled) { setResults(people ?? []); setActiveIndex(0); }
+      } catch {
+        if (!cancelled) setResults([]);
+      }
+    }, MENTION_SEARCH_DEBOUNCE_MS);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [active?.query, active?.start]);
+
+  function pick(person) {
+    if (!active) return;
+    const el = textareaRef.current?.getInputElement?.();
+    const caret = el ? el.selectionStart : active.start + active.query.length + 1;
+    const before = text.slice(0, active.start);
+    const after = text.slice(caret);
+    const insertion = `@${person.name} `;
+    setText(`${before}${insertion}${after}`);
+    setMentions((prev) => (
+      prev.some((m) => m.email === person.email) ? prev : [...prev, { email: person.email, name: person.name }]
+    ));
+    setActive(null);
+    setResults([]);
+    // Restore focus/caret after the inserted mention, once React commits.
+    requestAnimationFrame(() => {
+      const node = textareaRef.current?.getInputElement?.();
+      if (!node) return;
+      const pos = before.length + insertion.length;
+      node.focus();
+      node.setSelectionRange(pos, pos);
+    });
+  }
+
+  // Returns true if the key was consumed by list navigation (caller should preventDefault).
+  function handleKeyDown(e) {
+    if (!active || !results.length) return false;
+    if (e.key === 'ArrowDown') { setActiveIndex((i) => (i + 1) % results.length); return true; }
+    if (e.key === 'ArrowUp') { setActiveIndex((i) => (i - 1 + results.length) % results.length); return true; }
+    if (e.key === 'Enter' || e.key === 'Tab') { pick(results[activeIndex]); return true; }
+    if (e.key === 'Escape') { setActive(null); setResults([]); return true; }
+    return false;
+  }
+
+  function removeMention(email) {
+    setMentions((prev) => prev.filter((m) => m.email !== email));
+  }
+
+  // Closes the popover without touching picked mentions. Call on any dismiss
+  // path that bypasses handleKeyDown (mouse Send/Save, closing an editor).
+  function reset() {
+    setActive(null);
+    setResults([]);
+    setActiveIndex(0);
+  }
+
+  return {
+    textareaRef, results, activeIndex, setActiveIndex, syncFromCaret, handleKeyDown, pick, removeMention, reset,
+  };
+}
+
+function MentionSuggestions({ results, activeIndex, onPick, onHover }) {
+  if (!results.length) return null;
+  return (
+    <div className="cc-mention-popover" role="listbox" aria-label="Mention suggestions">
+      {results.map((person, i) => (
+        <button
+          type="button"
+          key={person.email}
+          role="option"
+          aria-selected={i === activeIndex}
+          className={`cc-mention-suggestion${i === activeIndex ? ' is-active' : ''}`}
+          onMouseEnter={() => onHover(i)}
+          // mousedown fires before blur, so pick()'s caret read is still valid.
+          onMouseDown={(e) => { e.preventDefault(); onPick(person); }}
+        >
+          <Avatar src={person.avatar} alt="" size={20} />
+          <span className="cc-mention-suggestion-text">
+            <span className="cc-mention-suggestion-name">{person.name}</span>
+            <span className="cc-mention-suggestion-email">{person.email}</span>
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MentionChips({ mentions, onRemove }) {
+  if (!mentions.length) return null;
+  return (
+    <TagGroup
+      aria-label="Mentioned people"
+      UNSAFE_className="cc-mention-chips"
+      items={mentions.map((m) => ({ id: m.email, ...m }))}
+      onRemove={(keys) => [...keys].forEach((email) => onRemove(email))}
+    >
+      {(item) => <Tag id={item.id}>{item.name}</Tag>}
+    </TagGroup>
+  );
+}
+
+// ── Thread assignee ──────────────────────────────────────────────────────────
+// Same Slack-directory search as @-mentions, but a standalone SearchField (no
+// caret to track). Persists via patchThread's `assignee` field — not
+// ownership-gated, unlike status.
+function AssigneePicker({ thread, onUpdate, onError }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    // Opening the picker fires this before any typing — skip the round trip
+    // on an empty query, same as the mention picker.
+    if (!query.trim()) { setResults([]); return undefined; }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const people = await sw('cc:api:searchPeople', { q: query });
+        if (!cancelled) setResults(people ?? []);
+      } catch {
+        if (!cancelled) setResults([]);
+      }
+    }, MENTION_SEARCH_DEBOUNCE_MS);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [open, query]);
+
+  async function assign(person) {
+    setSaving(true);
+    try {
+      const updated = await sw('cc:api:patchThread', { id: thread.id, data: { assignee: person?.email ?? null } });
+      onUpdate({ ...thread, assignee: updated?.assignee ?? (person ? { id: person.email, name: person.name } : null) });
+      setOpen(false);
+      setQuery('');
+      setResults([]);
+    } catch (err) {
+      onError?.(`Couldn't update assignee — ${err.message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (thread.assignee && !open) {
+    return (
+      <div className="cc-assignee">
+        <span className="cc-assignee-label">Assigned to</span>
+        <TagGroup
+          aria-label="Assignee"
+          items={[{ id: thread.assignee.id, name: thread.assignee.name }]}
+          onRemove={() => assign(null)}
+        >
+          {(item) => <Tag id={item.id}>{item.name}</Tag>}
+        </TagGroup>
+        <ActionButton isQuiet size="S" onPress={() => setOpen(true)} isDisabled={saving}>Change</ActionButton>
+      </div>
+    );
+  }
+
+  return (
+    <div className="cc-assignee">
+      {!open ? (
+        <ActionButton isQuiet size="S" onPress={() => setOpen(true)}>+ Assign</ActionButton>
+      ) : (
+        <div className="cc-assignee-picker">
+          <SearchField
+            aria-label="Search people to assign"
+            placeholder="Assign to…"
+            value={query}
+            onChange={setQuery}
+            autoFocus
+            size="S"
+          />
+          <MentionSuggestions results={results} activeIndex={-1} onPick={assign} onHover={() => {}} />
+          <ActionButton
+            isQuiet
+            size="S"
+            onPress={() => { setOpen(false); setQuery(''); setResults([]); }}
+            isDisabled={saving}
+          >
+            Cancel
+          </ActionButton>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Thread detail ─────────────────────────────────────────────────────────────
 
 function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpdate, onDelete, onScrollTo, onError }) {
   const [replyText, setReplyText] = useState('');
+  const [replyMentions, setReplyMentions] = useState([]);
   const [posting, setPosting] = useState(false);
   const commentsRef = useRef(null);
+  const mentionPicker = useMentionPicker(replyText, setReplyText, replyMentions, setReplyMentions);
 
   if (!thread) {
     // activeId is only ever set once the thread exists, so a missing thread
@@ -795,9 +1053,13 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
     setPosting(true);
     try {
       const authorName = myAuthorName(auth.profile);
-      const comment = await sw('cc:api:createComment', { threadId: thread.id, body: replyText.trim(), authorName });
+      const comment = await sw('cc:api:createComment', {
+        threadId: thread.id, body: replyText.trim(), authorName, mentions: replyMentions.map((m) => m.email),
+      });
       onUpdate({ ...thread, comments: [...(thread.comments ?? []), comment] });
       setReplyText('');
+      setReplyMentions([]);
+      mentionPicker.reset();
       // Bring the just-posted comment into view (comments render oldest→newest).
       // Double rAF so the scroll runs after React has committed the new node.
       requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -805,7 +1067,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         if (el) el.scrollTop = el.scrollHeight;
       }));
     } catch (err) {
-      // Leave replyText intact so the user doesn't lose what they wrote.
+      // Leave replyText/replyMentions intact so the user doesn't lose what they wrote.
       onError?.(`Couldn't post reply — ${err.message}`);
     } finally { setPosting(false); }
   }
@@ -863,6 +1125,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
           <ToggleButton id="in_progress">In progress</ToggleButton>
           <ToggleButton id="resolved">Resolved</ToggleButton>
         </ToggleButtonGroup>
+        <AssigneePicker thread={thread} onUpdate={onUpdate} onError={onError} />
       </div>
 
       <Divider size="S" />
@@ -885,15 +1148,31 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         ))}
       </div>
 
-      {/* Reply compose — Cmd/Ctrl+Enter submits */}
+      {/* Reply compose — Cmd/Ctrl+Enter submits, @name opens the mention picker */}
       <div className="cc-reply-area">
-        <div onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) postReply(); }}>
+        <MentionChips mentions={replyMentions} onRemove={mentionPicker.removeMention} />
+        <div
+          className="cc-mention-compose"
+          onKeyDown={(e) => {
+            if (mentionPicker.handleKeyDown(e)) { e.preventDefault(); return; }
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) postReply();
+          }}
+          onKeyUp={() => mentionPicker.syncFromCaret()}
+          onClick={() => mentionPicker.syncFromCaret()}
+        >
           <TextArea
+            ref={mentionPicker.textareaRef}
             value={replyText}
-            onChange={setReplyText}
-            placeholder="Reply…"
+            onChange={(v) => { setReplyText(v); mentionPicker.syncFromCaret(v); }}
+            placeholder="Reply… (@ to mention someone)"
             aria-label="Reply text"
             width="100%"
+          />
+          <MentionSuggestions
+            results={mentionPicker.results}
+            activeIndex={mentionPicker.activeIndex}
+            onPick={mentionPicker.pick}
+            onHover={mentionPicker.setActiveIndex}
           />
         </div>
         <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to send</div>
@@ -919,19 +1198,24 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
   // editText is seeded when the editor opens (see openEditor), not just at mount,
   // so it reflects the freshest server body if a poll updated it in the meantime.
   const [editText, setEditText] = useState(comment.body ?? '');
+  const [editMentions, setEditMentions] = useState(comment.mentions ?? []);
+  const mentionPicker = useMentionPicker(editText, setEditText, editMentions, setEditMentions);
   // Tri-state: 1 = upvoted, -1 = downvoted, 0 = not voted
   const [myVote, setMyVoteState] = useState(0);
 
   useEffect(() => { getMyVote(comment.id).then(setMyVoteState); }, [comment.id]);
 
   // Open/close the inline editor. On open, re-seed from the current comment.body
-  // so an edit that started after a background poll doesn't begin from stale
-  // text. While the editor is open, editText persists across re-renders, so an
-  // incoming poll never clobbers what the user is typing — the React analogue of
-  // milo's guard, which simply skips re-rendering the detail view during editing.
+  // (and mentions) so an edit that started after a background poll doesn't
+  // begin from stale text. While the editor is open, editText persists across
+  // re-renders, so an incoming poll never clobbers what the user is typing —
+  // the React analogue of milo's guard, which simply skips re-rendering the
+  // detail view during editing.
   function toggleEditor() {
+    mentionPicker.reset();
     if (editing) { setEditing(false); return; }
     setEditText(comment.body ?? '');
+    setEditMentions(comment.mentions ?? []);
     setEditing(true);
   }
 
@@ -939,9 +1223,15 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
     const body = editText.trim();
     if (!body) return;
     try {
-      const updated = await sw('cc:api:patchComment', { id: comment.id, body });
-      onUpdate({ ...comment, body: updated?.body ?? body, edited_at: updated?.edited_at ?? comment.edited_at });
+      const updated = await sw('cc:api:patchComment', { id: comment.id, body, mentions: editMentions.map((m) => m.email) });
+      onUpdate({
+        ...comment,
+        body: updated?.body ?? body,
+        mentions: updated?.mentions ?? editMentions,
+        edited_at: updated?.edited_at ?? comment.edited_at,
+      });
       setEditing(false);
+      mentionPicker.reset();
     } catch (err) {
       // Keep the editor open with the user's text so the edit isn't lost.
       onError?.(`Couldn't save edit — ${err.message}`);
@@ -1005,24 +1295,53 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
       </div>
 
       {editing ? (
-        /* ⌘/Ctrl+Enter saves — parity with the reply and compose boxes. */
-        <div onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit(); }}>
-          <TextArea
-            value={editText}
-            onChange={setEditText}
-            aria-label="Edit comment text"
-            width="100%"
-            autoFocus
-          />
+        <>
+          {/* ⌘/Ctrl+Enter saves — parity with the reply and compose boxes. @name opens the mention picker. */}
+          <MentionChips mentions={editMentions} onRemove={mentionPicker.removeMention} />
+          <div
+            className="cc-mention-compose"
+            onKeyDown={(e) => {
+              if (mentionPicker.handleKeyDown(e)) { e.preventDefault(); return; }
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit();
+            }}
+            onKeyUp={() => mentionPicker.syncFromCaret()}
+            onClick={() => mentionPicker.syncFromCaret()}
+          >
+            <TextArea
+              ref={mentionPicker.textareaRef}
+              value={editText}
+              onChange={(v) => { setEditText(v); mentionPicker.syncFromCaret(v); }}
+              aria-label="Edit comment text"
+              width="100%"
+              autoFocus
+            />
+            <MentionSuggestions
+              results={mentionPicker.results}
+              activeIndex={mentionPicker.activeIndex}
+              onPick={mentionPicker.pick}
+              onHover={mentionPicker.setActiveIndex}
+            />
+          </div>
           <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to save</div>
           <div className="cc-edit-actions">
-            <Button variant="secondary" size="S" onPress={() => setEditing(false)}>Cancel</Button>
+            <Button variant="secondary" size="S" onPress={() => { setEditing(false); mentionPicker.reset(); }}>Cancel</Button>
             <Button variant="accent" size="S" onPress={saveEdit} isDisabled={!editText.trim()}>Save</Button>
           </div>
-        </div>
+        </>
       ) : (
-        /* Strip any HTML from milo-authored bodies; plain-text input stays as-is */
-        <p className="cc-comment-body">{stripHtml(comment.body ?? '')}</p>
+        <>
+          {/* Strip any HTML from milo-authored bodies; plain-text input stays as-is */}
+          <p className="cc-comment-body">{renderMentionHighlights(stripHtml(comment.body ?? ''), comment.mentions)}</p>
+          {comment.mentions?.length > 0 && (
+            <TagGroup
+              aria-label="Mentioned people"
+              UNSAFE_className="cc-mention-chips"
+              items={comment.mentions.map((m) => ({ id: m.email, ...m }))}
+            >
+              {(item) => <Tag id={item.id}>{item.name}</Tag>}
+            </TagGroup>
+          )}
+        </>
       )}
 
       <div className="cc-vote-row">

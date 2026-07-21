@@ -287,13 +287,19 @@ async function handleMessage(msg, sender) {
   if (type === 'cc:api:createComment') {
     return apiRequest('/comments', {
       method: 'POST',
-      body: JSON.stringify({ thread_id: msg.threadId, body: msg.body, author_name: msg.authorName }),
+      body: JSON.stringify({
+        thread_id: msg.threadId, body: msg.body, author_name: msg.authorName, mentions: msg.mentions ?? [],
+      }),
     });
   }
   if (type === 'cc:api:patchComment') {
+    // Field absent = leave unchanged, field present = replace (see
+    // updateComment in milo-logs-deploy's comments.js).
+    const body = { body: msg.body };
+    if (msg.mentions !== undefined) body.mentions = msg.mentions;
     return apiRequest(`/comments/${msg.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ body: msg.body }),
+      body: JSON.stringify(body),
     });
   }
   if (type === 'cc:api:deleteComment') {
@@ -304,6 +310,11 @@ async function handleMessage(msg, sender) {
       method: 'POST',
       body: JSON.stringify({ upvoteDelta: msg.upvoteDelta ?? 0, downvoteDelta: msg.downvoteDelta ?? 0 }),
     });
+  }
+  // @-mention/assignee picker search (see milo-logs-deploy's people.js). Fires
+  // on every keystroke, so a stale token should fail quietly, not pop a sign-in window.
+  if (type === 'cc:api:searchPeople') {
+    return apiRequest(`/people?q=${encodeURIComponent(msg.q ?? '')}`, {}, true, { interactive: false });
   }
 
   // ── Auth ────────────────────────────────────────────────────────────────
