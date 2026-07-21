@@ -16,7 +16,7 @@
  *   theme      — 'light'|'dark'
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import '@react-spectrum/s2/page.css';
 import '../sidepanel.css';
@@ -35,8 +35,9 @@ import {
   Divider,
   DialogTrigger,
   AlertDialog,
-  TextArea,
 } from '@react-spectrum/s2';
+import { sanitizeHtml, stripHtml } from './sanitize.js';
+import QuillEditor from './QuillEditor.jsx';
 import BrightnessContrastIcon from '@react-spectrum/s2/icons/BrightnessContrast';
 import ChevronLeftIcon from '@react-spectrum/s2/icons/ChevronLeft';
 import CircleIcon from '@react-spectrum/s2/icons/Circle';
@@ -49,6 +50,14 @@ import SelectRectangleIcon from '@react-spectrum/s2/icons/SelectRectangle';
 import TargetIcon from '@react-spectrum/s2/icons/Target';
 import ThumbDownIcon from '@react-spectrum/s2/icons/ThumbDown';
 import ThumbUpIcon from '@react-spectrum/s2/icons/ThumbUp';
+
+// A pasted screenshot is embedded as base64, which can bloat a comment body
+// into the MBs. background.js's API proxy has no size guard of its own and
+// the backend's storage limit for the `body` column is unconfirmed, so cap
+// defensively here rather than let a huge POST silently time out or fail
+// server-side (MWPW-201267).
+const MAX_COMMENT_BODY_CHARS = 2_000_000; // ~2MB
+const BODY_TOO_LARGE_MSG = "That comment is too large to post — try a smaller or cropped screenshot.";
 
 // ── Send to service worker ────────────────────────────────────────────────────
 
@@ -116,16 +125,6 @@ async function getMyVote(commentId) {
 async function setMyVote(commentId, v) {
   if (v === 0) return storage.set(`vote:${commentId}`, null);
   return storage.set(`vote:${commentId}`, v);
-}
-
-// Extract plain text from a (possibly HTML) comment body — milo stores Quill
-// rich text, so bodies can contain markup. Parse with DOMParser rather than
-// assigning innerHTML on a live-document element: a DOMParser document has no
-// browsing context, so embedded resources (e.g. `<img src>`) never load and no
-// beacon fires while we're only reading textContent.
-function stripHtml(html) {
-  if (!html) return '';
-  return new DOMParser().parseFromString(html, 'text/html').body.textContent ?? '';
 }
 
 // Human-readable status label. Undefined/null is treated as 'open'.
@@ -738,7 +737,11 @@ function ThreadCard({ thread, resolution, onClick }) {
 // ── Thread detail ─────────────────────────────────────────────────────────────
 
 function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpdate, onDelete, onScrollTo, onError }) {
-  const [replyText, setReplyText] = useState('');
+  // The reply editor is an uncontrolled Quill instance (see QuillEditor) — we
+  // don't hold its HTML in state on every keystroke, just whether it's empty
+  // (to drive the Reply button's disabled state).
+  const replyEditorRef = useRef(null);
+  const [replyEmpty, setReplyEmpty] = useState(true);
   const [posting, setPosting] = useState(false);
   const commentsRef = useRef(null);
 
@@ -791,13 +794,20 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   }
 
   async function postReply() {
-    if (!replyText.trim()) return;
+    const editor = replyEditorRef.current;
+    if (!editor || !editor.getText().trim()) return;
+    // Store the raw (unsanitized) Quill HTML — same as milo — and sanitize
+    // only at render time (CommentItem), so a future allow-list widening
+    // doesn't require re-saving old comments.
+    const body = editor.getHtml();
+    if (body.length > MAX_COMMENT_BODY_CHARS) { onError?.(BODY_TOO_LARGE_MSG); return; }
     setPosting(true);
     try {
       const authorName = myAuthorName(auth.profile);
-      const comment = await sw('cc:api:createComment', { threadId: thread.id, body: replyText.trim(), authorName });
+      const comment = await sw('cc:api:createComment', { threadId: thread.id, body, authorName });
       onUpdate({ ...thread, comments: [...(thread.comments ?? []), comment] });
-      setReplyText('');
+      editor.clear();
+      setReplyEmpty(true);
       // Bring the just-posted comment into view (comments render oldest→newest).
       // Double rAF so the scroll runs after React has committed the new node.
       requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -805,7 +815,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         if (el) el.scrollTop = el.scrollHeight;
       }));
     } catch (err) {
-      // Leave replyText intact so the user doesn't lose what they wrote.
+      // Leave the editor's contents intact so the user doesn't lose what they wrote.
       onError?.(`Couldn't post reply — ${err.message}`);
     } finally { setPosting(false); }
   }
@@ -888,12 +898,11 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
       {/* Reply compose — Cmd/Ctrl+Enter submits */}
       <div className="cc-reply-area">
         <div onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) postReply(); }}>
-          <TextArea
-            value={replyText}
-            onChange={setReplyText}
+          <QuillEditor
+            ref={replyEditorRef}
             placeholder="Reply…"
             aria-label="Reply text"
-            width="100%"
+            onEmptyChange={setReplyEmpty}
           />
         </div>
         <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to send</div>
@@ -902,7 +911,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
             variant="accent"
             size="S"
             onPress={postReply}
-            isDisabled={posting || !replyText.trim()}
+            isDisabled={posting || replyEmpty}
           >
             {posting ? 'Posting…' : 'Reply'}
           </Button>
@@ -912,32 +921,47 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   );
 }
 
+// Sanitized render of a (possibly HTML) comment body — milo stores Quill rich
+// text, so bodies may contain markup, including links and inline images
+// (MWPW-201267). sanitizeHtml allow-lists tags/attrs and re-gates img/a URLs
+// through safeMediaUrl (see sanitize.js), so this is safe to render as HTML.
+// Memoized because pasted-screenshot bodies can be large base64 strings and
+// comment.body only changes on edit, not every parent re-render.
+function CommentBody({ body }) {
+  const safe = useMemo(() => sanitizeHtml(body ?? ''), [body]);
+  // A <div>, not <p> — sanitized output can itself contain block-level <p>,
+  // which is invalid nested inside a <p>.
+  return <div className="cc-comment-body" dangerouslySetInnerHTML={{ __html: safe }} />;
+}
+
 // ── Comment item ──────────────────────────────────────────────────────────────
 
 function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }) {
   const [editing, setEditing] = useState(false);
-  // editText is seeded when the editor opens (see openEditor), not just at mount,
-  // so it reflects the freshest server body if a poll updated it in the meantime.
-  const [editText, setEditText] = useState(comment.body ?? '');
+  const [editEmpty, setEditEmpty] = useState(false);
+  // The edit editor is an uncontrolled Quill instance mounted fresh each time
+  // `editing` flips true (see the conditional render below), seeded from
+  // comment.body via QuillEditor's initialHtml — so it always reflects the
+  // freshest server body if a poll updated it in the meantime, without needing
+  // React state to hold the HTML on every keystroke.
+  const editorRef = useRef(null);
   // Tri-state: 1 = upvoted, -1 = downvoted, 0 = not voted
   const [myVote, setMyVoteState] = useState(0);
 
   useEffect(() => { getMyVote(comment.id).then(setMyVoteState); }, [comment.id]);
 
-  // Open/close the inline editor. On open, re-seed from the current comment.body
-  // so an edit that started after a background poll doesn't begin from stale
-  // text. While the editor is open, editText persists across re-renders, so an
-  // incoming poll never clobbers what the user is typing — the React analogue of
-  // milo's guard, which simply skips re-rendering the detail view during editing.
+  // Open/close the inline editor. While it's open, an incoming poll never
+  // clobbers what the user is typing — the React analogue of milo's guard,
+  // which simply skips re-rendering the detail view during editing.
   function toggleEditor() {
-    if (editing) { setEditing(false); return; }
-    setEditText(comment.body ?? '');
-    setEditing(true);
+    setEditing((prev) => !prev);
   }
 
   async function saveEdit() {
-    const body = editText.trim();
-    if (!body) return;
+    const editor = editorRef.current;
+    if (!editor || !editor.getText().trim()) return;
+    const body = editor.getHtml();
+    if (body.length > MAX_COMMENT_BODY_CHARS) { onError?.(BODY_TOO_LARGE_MSG); return; }
     try {
       const updated = await sw('cc:api:patchComment', { id: comment.id, body });
       onUpdate({ ...comment, body: updated?.body ?? body, edited_at: updated?.edited_at ?? comment.edited_at });
@@ -1007,22 +1031,21 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
       {editing ? (
         /* ⌘/Ctrl+Enter saves — parity with the reply and compose boxes. */
         <div onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit(); }}>
-          <TextArea
-            value={editText}
-            onChange={setEditText}
+          <QuillEditor
+            ref={editorRef}
+            initialHtml={comment.body ?? ''}
             aria-label="Edit comment text"
-            width="100%"
+            onEmptyChange={setEditEmpty}
             autoFocus
           />
           <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to save</div>
           <div className="cc-edit-actions">
             <Button variant="secondary" size="S" onPress={() => setEditing(false)}>Cancel</Button>
-            <Button variant="accent" size="S" onPress={saveEdit} isDisabled={!editText.trim()}>Save</Button>
+            <Button variant="accent" size="S" onPress={saveEdit} isDisabled={editEmpty}>Save</Button>
           </div>
         </div>
       ) : (
-        /* Strip any HTML from milo-authored bodies; plain-text input stays as-is */
-        <p className="cc-comment-body">{stripHtml(comment.body ?? '')}</p>
+        <CommentBody body={comment.body} />
       )}
 
       <div className="cc-vote-row">

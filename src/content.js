@@ -261,21 +261,41 @@ if (window.__chitChatLoaded) {
   // selectors from matching at all. `:host(.cc-dark)` mirrors the panel's
   // light/dark toggle (synced via chrome.storage.sync, see _theme).
   const COMPOSE_SHADOW_CSS = `
-    textarea { display: block; width: 100%; min-height: 120px; max-height: 45vh;
+    /* Rich compose editable (MWPW-201267) — replaces the plain <textarea>
+       that used to live here; a contenteditable div lets QA author inline
+       bold/italic/links/pasted screenshots without pulling a full editor
+       (Quill) into every host page's injected script. */
+    .cc-compose-editable { display: block; width: 100%; min-height: 120px; max-height: 45vh;
                box-sizing: border-box; overflow-y: auto;
                border: 1px solid #ccc; border-radius: 4px; padding: 8px;
                font: 13px/1.5 -apple-system, sans-serif; color: #1b1b1b; background: #fff;
-               resize: vertical; outline-color: #0265DC; }
+               outline-color: #0265DC; }
+    .cc-compose-editable:empty::before { content: attr(data-placeholder); color: #888; }
+    .cc-compose-editable img { display: block; max-width: 100%; margin: 4px 0; border-radius: 4px; }
+    .cc-compose-editable a { color: #0265DC; text-decoration: underline; }
+    .cc-compose-toolbar { display: flex; gap: 4px; margin-bottom: 6px; }
+    .cc-compose-toolbtn { min-width: 28px; height: 26px; padding: 0 6px; border-radius: 4px;
+                          border: 1px solid #ccc; cursor: pointer;
+                          font: 12px/1 -apple-system, sans-serif; color: #1b1b1b; background: #fff; }
+    .cc-compose-toolbtn:hover { background: #f0f0f0; }
+    .cc-compose-linkform { display: flex; gap: 6px; margin-bottom: 6px; }
+    .cc-compose-linkform input { flex: 1; min-width: 0; padding: 4px 6px; box-sizing: border-box;
+                                 border: 1px solid #ccc; border-radius: 4px;
+                                 font: 12px/1.4 -apple-system, sans-serif; }
     .cc-compose-hint { margin-top: 6px; font: 11px/1.4 -apple-system, sans-serif;
                        color: #6d6d6d; }
+    .cc-compose-hint.cc-compose-error { color: #c0392b; font-weight: 600; }
     .cc-compose-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
     button { padding: 6px 14px; border-radius: 4px; border: 1px solid #ccc;
              cursor: pointer; font: 13px/1 -apple-system, sans-serif; color: #1b1b1b; background: #fff; }
     .cc-compose-save { background: #0265DC; color: #fff; border-color: #0265DC; }
     .cc-compose-cancel { background: #fff; color: #1b1b1b; }
-    :host(.cc-dark) textarea { background: #1e1e1e; border-color: #555; color: #eee; }
+    :host(.cc-dark) .cc-compose-editable { background: #1e1e1e; border-color: #555; color: #eee; }
+    :host(.cc-dark) .cc-compose-editable a { color: #5aa2ff; }
     :host(.cc-dark) .cc-compose-hint { color: #aaa; }
-    :host(.cc-dark) button { background: #3a3a3a; border-color: #555; color: #eee; }
+    :host(.cc-dark) button, :host(.cc-dark) .cc-compose-toolbtn { background: #3a3a3a; border-color: #555; color: #eee; }
+    :host(.cc-dark) .cc-compose-toolbtn:hover { background: #4a4a4a; }
+    :host(.cc-dark) .cc-compose-linkform input { background: #1e1e1e; border-color: #555; color: #eee; }
     :host(.cc-dark) .cc-compose-save { background: #0265DC; border-color: #0265DC; color: #fff; }
     :host(.cc-dark) .cc-compose-cancel { background: #3a3a3a; color: #eee; }
   `;
@@ -807,6 +827,13 @@ if (window.__chitChatLoaded) {
 
   // ── Compose popover ────────────────────────────────────────────────────────
 
+  // A pasted screenshot is embedded as base64, which can bloat a comment body
+  // into the MBs. background.js's API proxy has no size guard of its own and
+  // the backend's storage limit for the `body` column is unconfirmed, so cap
+  // defensively here (mirrors the same threshold in sidepanel.jsx) rather than
+  // let a huge POST silently time out or fail server-side (MWPW-201267).
+  const MAX_COMPOSE_BODY_CHARS = 2_000_000; // ~2MB
+
   let _composeSaveBtn = null; // shadow-root button ref; can't querySelector across the boundary
 
   function openCompose(el, selection, cx, cy) {
@@ -842,25 +869,184 @@ if (window.__chitChatLoaded) {
     style.textContent = COMPOSE_SHADOW_CSS;
     root.appendChild(style);
 
-    const textarea = document.createElement('textarea');
-    textarea.placeholder = 'Leave a comment… write as much as you need.';
-    root.appendChild(textarea);
+    // Rich compose (MWPW-201267): a small toolbar + contenteditable div in
+    // place of the plain <textarea>, so QA can author bold/italic, a link,
+    // and paste screenshots inline. We store raw contenteditable HTML —
+    // sanitizeHtml (sidepanel.jsx) is the security gate at render time, so
+    // there's no need to sanitize here, only to keep authoring usable.
+    const toolbar = document.createElement('div');
+    toolbar.className = 'cc-compose-toolbar';
 
-    // Grow with content up to the CSS max-height (45vh), then the textarea's
+    const editable = document.createElement('div');
+    editable.className = 'cc-compose-editable';
+    editable.contentEditable = 'true';
+    editable.setAttribute('role', 'textbox');
+    editable.setAttribute('aria-multiline', 'true');
+    editable.setAttribute('aria-label', 'Comment text');
+    editable.dataset.placeholder = 'Leave a comment… write as much as you need.';
+
+    // Grow with content up to the CSS max-height (45vh), then the editable's
     // own scrollbar takes over — comfortable for long, multi-paragraph feedback.
     // The popover's top was placed once from the initial size estimate, so after
     // growing, nudge it up if the taller box would spill past the viewport bottom.
     const autoGrow = () => {
-      textarea.style.height = 'auto';
-      const cap = Math.round(window.innerHeight * 0.45);
-      textarea.style.height = `${Math.min(textarea.scrollHeight, cap)}px`;
       const rect = pop.getBoundingClientRect();
       const margin = 8;
       if (rect.bottom > window.innerHeight - margin) {
         pop.style.top = `${Math.max(margin, window.innerHeight - margin - rect.height)}px`;
       }
     };
-    textarea.addEventListener('input', autoGrow);
+    editable.addEventListener('input', autoGrow);
+
+    // Keep the current selection so a toolbar click (which can steal focus,
+    // e.g. the link URL input) still applies to where the caret/selection was.
+    let savedRange = null;
+    function saveRange() {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0 && editable.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+        savedRange = sel.getRangeAt(0).cloneRange();
+      }
+    }
+    function restoreRange() {
+      if (!savedRange) return;
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(savedRange);
+    }
+    editable.addEventListener('keyup', saveRange);
+    editable.addEventListener('mouseup', saveRange);
+
+    function mkToolBtn(label, title, onClick) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'cc-compose-toolbtn';
+      b.title = title;
+      b.textContent = label;
+      // Prevent the mousedown from moving focus off `editable`, so bold/italic
+      // apply to the selection that's still active at click time.
+      b.addEventListener('mousedown', (e) => e.preventDefault());
+      b.addEventListener('click', onClick);
+      return b;
+    }
+
+    const boldBtn = mkToolBtn('B', 'Bold', () => {
+      editable.focus();
+      document.execCommand('bold');
+    });
+    const italicBtn = mkToolBtn('I', 'Italic', () => {
+      editable.focus();
+      document.execCommand('italic');
+    });
+
+    const linkForm = document.createElement('div');
+    linkForm.className = 'cc-compose-linkform';
+    linkForm.style.display = 'none';
+    const linkInput = document.createElement('input');
+    linkInput.type = 'text';
+    linkInput.placeholder = 'https://…';
+    const linkAdd = document.createElement('button');
+    linkAdd.type = 'button'; linkAdd.className = 'cc-compose-toolbtn'; linkAdd.textContent = 'Add';
+    linkForm.append(linkInput, linkAdd);
+
+    const linkBtn = mkToolBtn('🔗', 'Insert link', () => {
+      saveRange();
+      linkForm.style.display = linkForm.style.display === 'none' ? 'flex' : 'none';
+      if (linkForm.style.display === 'flex') linkInput.focus();
+    });
+    function commitLink() {
+      const url = linkInput.value.trim();
+      linkForm.style.display = 'none';
+      linkInput.value = '';
+      if (!url) return;
+      editable.focus();
+      restoreRange();
+      // safeMediaUrl (sanitize.js) re-validates the scheme at render time
+      // regardless — this is just so an obviously-bad scheme isn't authored.
+      if (/^\s*(javascript|data|vbscript):/i.test(url)) return;
+      if (window.getSelection()?.isCollapsed) {
+        document.execCommand('insertHTML', false, `<a href="${url.replace(/"/g, '&quot;')}">${url.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</a>`);
+      } else {
+        document.execCommand('createLink', false, url);
+      }
+      autoGrow();
+    }
+    linkAdd.addEventListener('click', commitLink);
+    linkInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commitLink(); }
+      if (e.key === 'Escape') { e.stopPropagation(); linkForm.style.display = 'none'; editable.focus(); }
+    });
+
+    // Downscale oversized pastes/inserts before embedding as base64 — a
+    // full-resolution screenshot can be several MB, which both bloats the
+    // stored comment body and risks the API proxy's request timeout.
+    function downscaleImage(dataUrl, maxDim) {
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+          if (!img.naturalWidth || scale >= 1) { resolve(dataUrl); return; }
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(img.naturalWidth * scale);
+          canvas.height = Math.round(img.naturalHeight * scale);
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/png'));
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+      });
+    }
+
+    function insertImageFile(file) {
+      if (!file.type.startsWith('image/')) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const raw = reader.result;
+        if (typeof raw !== 'string' || !raw.startsWith('data:image/')) return;
+        downscaleImage(raw, 1600).then((dataUrl) => {
+          editable.focus();
+          restoreRange();
+          document.execCommand('insertHTML', false, `<img src="${dataUrl}">`);
+          autoGrow();
+        });
+      };
+      reader.readAsDataURL(file);
+    }
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'image/*';
+    fileInput.style.display = 'none';
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files?.[0];
+      if (file) insertImageFile(file);
+      fileInput.value = '';
+    });
+
+    const imageBtn = mkToolBtn('🖼', 'Insert image', () => {
+      saveRange();
+      fileInput.click();
+    });
+
+    // The core QA flow: paste a screenshot straight into the comment.
+    editable.addEventListener('paste', (e) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          e.preventDefault();
+          const file = item.getAsFile();
+          if (file) insertImageFile(file);
+          return;
+        }
+      }
+      // Non-image paste (plain/rich text from elsewhere) falls through to the
+      // browser's default paste; sanitizeHtml still gates whatever lands here
+      // at render time, so an unexpected tag from another page is harmless.
+    });
+
+    toolbar.append(boldBtn, italicBtn, linkBtn, imageBtn);
+    root.append(toolbar, editable, linkForm, fileInput);
 
     const hint = document.createElement('p');
     hint.className = 'cc-compose-hint';
@@ -877,8 +1063,14 @@ if (window.__chitChatLoaded) {
     const save = document.createElement('button');
     save.className = 'cc-compose-save'; save.textContent = 'Post';
     save.addEventListener('click', () => {
-      const body = textarea.value.trim();
-      if (!body) return;
+      const text = editable.textContent.trim();
+      if (!text) return;
+      const body = editable.innerHTML;
+      if (body.length > MAX_COMPOSE_BODY_CHARS) {
+        hint.textContent = 'That comment is too large to post — try a smaller or cropped screenshot.';
+        hint.classList.add('cc-compose-error');
+        return;
+      }
       closeCompose();
       toPanel('cc:panel:anchorCaptured', {
         anchor,
@@ -890,7 +1082,13 @@ if (window.__chitChatLoaded) {
     actions.append(cancel, save);
     root.appendChild(actions);
     document.body.appendChild(pop);
-    textarea.focus();
+    editable.focus();
+    // Without this, Chrome wraps each Enter-separated line in a bare <div>
+    // (the browser's default), which sanitizeHtml's allow-list doesn't
+    // include — DOMPurify unwraps disallowed-but-safe tags and keeps their
+    // text with no separator, so multi-line comments would render as one
+    // run-on line. <p> is allow-listed, so make it the separator instead.
+    document.execCommand('defaultParagraphSeparator', false, 'p');
 
     _composeSaveBtn = save;
     document.addEventListener('keydown', onComposeKey);

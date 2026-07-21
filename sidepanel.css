@@ -267,6 +267,46 @@ html, body {
   word-break: break-word;
 }
 
+/* Rich-body content (MWPW-201267): Quill-authored bodies use real <p>/<br>,
+   but comments written before this feature are plain text with literal
+   newlines and no wrapping tags — keep white-space: pre-wrap above so those
+   still render their line breaks. Quill's HTML has no stray text-node
+   newlines between tags, so pre-wrap doesn't add any visible extra spacing
+   there. */
+.cc-comment-body p {
+  margin: 0 0 8px;
+}
+
+.cc-comment-body p:last-child {
+  margin-bottom: 0;
+}
+
+.cc-comment-body a {
+  color: light-dark(#0265dc, #5aa2ff);
+  text-decoration: underline;
+}
+
+.cc-comment-body img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  max-height: 320px;
+  margin: 6px 0;
+  border-radius: 4px;
+}
+
+/* Quill's own mount + snow theme are dropped into the reply/edit compose
+   areas in place of the plain TextArea (MWPW-201267). */
+.cc-quill-mount .ql-editor {
+  font-size: 14px;
+  min-height: 60px;
+}
+
+.cc-quill-fallback {
+  width: 100%;
+  box-sizing: border-box;
+}
+
 .cc-edit-actions {
   display: flex;
   gap: 6px;
