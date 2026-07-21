@@ -311,15 +311,22 @@ html, body {
 .cc-emoji-btn {
   height: 24px;
   width: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border: none;
   background: transparent;
   cursor: pointer;
-  font-size: 14px;
   border-radius: 4px;
 }
 
 .cc-emoji-btn:hover {
   background: light-dark(rgba(0, 0, 0, 0.06), rgba(255, 255, 255, 0.1));
+}
+
+.cc-emoji-icon {
+  width: 16px;
+  height: 16px;
 }
 
 .cc-emoji-popover {

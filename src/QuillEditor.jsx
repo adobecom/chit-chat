@@ -5,10 +5,12 @@
  * panel's MV3 CSP is script-src 'self'. Uncontrolled by design — `getHtml`/
  * `onEmptyChange` read Quill's own DOM instead of mirroring it into state.
  */
-import { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
+import { useEffect, useRef, useState, useImperativeHandle, forwardRef } from 'react';
+import { createPortal } from 'react-dom';
 import Quill from 'quill';
 import 'quill/dist/quill.snow.css';
 import { escAttr, stripHtml } from './sanitize.js';
+import EmojiIcon from '@react-spectrum/s2/icons/Emoji';
 
 // Downscale pasted/inserted screenshots before embedding as base64 — full
 // resolution can be several MB. Duplicated in content.js, which can't
@@ -63,8 +65,10 @@ const EMOJIS = ['👍', '👎', '😀', '😂', '🎉', '🔥', '👀', '✅', '
 
 // Quill's array-based toolbar only renders buttons for built-in formats, so
 // the emoji picker is appended to the generated toolbar by hand rather than
-// through modules.toolbar. mousedown/preventDefault on every button keeps
-// focus (and Quill's last selection range) in the editor.
+// through modules.toolbar — including its icon, which is left for the caller
+// to portal an S2 <EmojiIcon> into (see the `button` returned below), since
+// this runs outside React's render. mousedown/preventDefault on every button
+// keeps focus (and Quill's last selection range) in the editor.
 function attachEmojiPicker(quill, toolbarEl) {
   const wrap = document.createElement('span');
   wrap.className = 'cc-emoji-wrap';
@@ -76,7 +80,6 @@ function attachEmojiPicker(quill, toolbarEl) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'cc-emoji-btn';
-  btn.textContent = '🙂';
   btn.title = 'Insert emoji';
   btn.setAttribute('aria-label', 'Insert emoji');
   btn.addEventListener('mousedown', (e) => e.preventDefault());
@@ -104,7 +107,7 @@ function attachEmojiPicker(quill, toolbarEl) {
 
   wrap.append(btn, popover);
   toolbarEl.appendChild(wrap);
-  return () => document.removeEventListener('click', onDocClick);
+  return { button: btn, detach: () => document.removeEventListener('click', onDocClick) };
 }
 
 const QuillEditor = forwardRef(function QuillEditor(
@@ -119,6 +122,7 @@ const QuillEditor = forwardRef(function QuillEditor(
 ) {
   const mountRef = useRef(null);
   const quillRef = useRef(null);
+  const [emojiBtn, setEmojiBtn] = useState(null);
 
   useImperativeHandle(ref, () => ({
     getHtml() {
@@ -166,7 +170,11 @@ const QuillEditor = forwardRef(function QuillEditor(
       if (autoFocus) q.focus();
 
       const toolbarEl = el.querySelector('.ql-toolbar');
-      if (toolbarEl) detachEmojiPicker = attachEmojiPicker(q, toolbarEl);
+      if (toolbarEl) {
+        const picker = attachEmojiPicker(q, toolbarEl);
+        detachEmojiPicker = picker.detach;
+        setEmojiBtn(picker.button);
+      }
     } catch {
       // Fallback if Quill fails to construct (e.g. unexpected DOM state) —
       // keep the box usable as plain text rather than losing compose entirely.
@@ -176,11 +184,19 @@ const QuillEditor = forwardRef(function QuillEditor(
 
     return () => {
       detachEmojiPicker?.();
+      setEmojiBtn(null);
       quillRef.current = null;
     };
   }, []); // intentionally run once — this is an uncontrolled editor
 
-  return <div ref={mountRef} className="cc-quill-mount" />;
+  return (
+    <>
+      <div ref={mountRef} className="cc-quill-mount" />
+      {/* attachEmojiPicker builds the button imperatively (outside React,
+          alongside Quill's own toolbar DOM) — portal the S2 icon into it. */}
+      {emojiBtn && createPortal(<EmojiIcon aria-hidden UNSAFE_className="cc-emoji-icon" />, emojiBtn)}
+    </>
+  );
 });
 
 export default QuillEditor;
