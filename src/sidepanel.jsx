@@ -131,15 +131,11 @@ function stripHtml(html) {
   return new DOMParser().parseFromString(html, 'text/html').body.textContent ?? '';
 }
 
-// Splits a comment body into plain text + highlighted "@Name" spans, using
-// comment.mentions as the source of truth for which @-prefixed substrings are
-// real mentions (so a stray "@" elsewhere in the text is left alone). Returns
-// an array of strings/elements — rendered as React children, so this is
-// auto-escaped like the plain-text render it replaces; no dangerouslySetInnerHTML.
+// Highlights "@Name" substrings matched against comment.mentions (not raw
+// "@" text). Returns React children, so this stays auto-escaped.
 function renderMentionHighlights(text, mentions) {
   const names = [...new Set((mentions ?? []).map((m) => m.name).filter(Boolean))]
-    // Longest names first, so "@Alice Reza" isn't cut short by a "@Alice" match
-    // from a different mention on the same comment.
+    // Longest names first, so "@Alice Reza" isn't cut short by "@Alice" from another mention.
     .sort((a, b) => b.length - a.length)
     .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   if (!names.length) return text;
@@ -766,26 +762,16 @@ function ThreadCard({ thread, resolution, onClick }) {
 }
 
 // ── @-mention autocomplete ───────────────────────────────────────────────────
-//
-// Slack-style "@" trigger: typing "@" followed by non-space characters opens
-// a floating suggestion list backed by the Slack workspace directory
-// (cc:api:searchPeople — see background.js / milo-logs-deploy's
-// src/annotations/people.js). Picking a person splices "@Display Name " into
-// the text and adds their email to the mentions set that rides along with
-// the comment. S2's TextArea is a plain textarea (no rich-text token
-// support), so this is a floating list below the field rather than a
-// caret-anchored popover, and a mention is tracked by its inserted text +
-// email pair rather than as an atomic token — editing the inserted name text
-// doesn't un-mention the person. Shared by the reply composer (ThreadDetail)
-// and the inline edit editor (CommentItem).
+// "@" opens a floating suggestion list (cc:api:searchPeople). Not caret-
+// anchored — S2's TextArea has no rich-text token support, so a mention is
+// just inserted text + an email tracked alongside it, not an atomic token.
+// Shared by the reply composer (ThreadDetail) and edit editor (CommentItem).
 
 const MENTION_SEARCH_DEBOUNCE_MS = 150;
 
-// Finds the in-progress "@query" ending exactly at `caret`, or null. The "@"
-// must be at the start of the text or preceded by whitespace, so typing an
-// email inline (e.g. "foo@adobe.com") never triggers the picker. Closes on a
-// space — good enough for name-prefix matching, though it means multi-word
-// names must be picked from the list rather than fully typed out.
+// Finds the in-progress "@query" ending at `caret`. Requires whitespace/
+// start-of-string before "@" (so "foo@adobe.com" doesn't trigger it), and
+// closes on a space (multi-word names must be picked from the list).
 function findMentionQuery(text, caret) {
   if (caret == null) return null;
   const before = text.slice(0, caret);
@@ -802,9 +788,8 @@ function useMentionPicker(text, setText, mentions, setMentions) {
   const [results, setResults] = useState([]);
   const [activeIndex, setActiveIndex] = useState(0);
 
-  // Re-derive the active @-query from the textarea's current caret position.
-  // Called after every change/click/key-up, since S2 TextArea's onChange only
-  // hands back the new string, not a DOM event to read selectionStart from.
+  // Re-derives the active @-query from the caret; onChange only gives the new
+  // string, not a DOM event, so callers pass this after change/click/key-up.
   function syncFromCaret(nextText = text) {
     const el = textareaRef.current?.getInputElement?.();
     const found = el ? findMentionQuery(nextText, el.selectionStart) : null;
@@ -814,10 +799,8 @@ function useMentionPicker(text, setText, mentions, setMentions) {
 
   useEffect(() => {
     if (!active) return undefined;
-    // The backend rejects an empty q with [] anyway (searchPeople's own early
-    // return) — skip the round trip entirely rather than debounce-then-fetch
-    // a result we already know is empty. Matters right after typing a bare
-    // "@" with nothing after it yet.
+    // Empty query (e.g. right after typing a bare "@") → skip the round trip;
+    // the backend returns [] for it anyway.
     if (!active.query.trim()) { setResults([]); return undefined; }
     let cancelled = false;
     const timer = setTimeout(async () => {
@@ -844,7 +827,7 @@ function useMentionPicker(text, setText, mentions, setMentions) {
     ));
     setActive(null);
     setResults([]);
-    // Restore focus + caret just after the inserted mention, once React commits.
+    // Restore focus/caret after the inserted mention, once React commits.
     requestAnimationFrame(() => {
       const node = textareaRef.current?.getInputElement?.();
       if (!node) return;
@@ -854,8 +837,7 @@ function useMentionPicker(text, setText, mentions, setMentions) {
     });
   }
 
-  // Returns true if the key was consumed by suggestion-list navigation —
-  // callers should preventDefault() and skip their own handling in that case.
+  // Returns true if the key was consumed by list navigation (caller should preventDefault).
   function handleKeyDown(e) {
     if (!active || !results.length) return false;
     if (e.key === 'ArrowDown') { setActiveIndex((i) => (i + 1) % results.length); return true; }
@@ -869,11 +851,8 @@ function useMentionPicker(text, setText, mentions, setMentions) {
     setMentions((prev) => prev.filter((m) => m.email !== email));
   }
 
-  // Closes the suggestion popover without touching the mentions already
-  // picked. Callers must invoke this on every path that clears/replaces the
-  // text without going through handleKeyDown/pick — e.g. clicking a Send/Save
-  // button with the mouse, or closing and reopening an editor — otherwise a
-  // stale popover from a previous in-progress "@query" can linger.
+  // Closes the popover without touching picked mentions. Call on any dismiss
+  // path that bypasses handleKeyDown (mouse Send/Save, closing an editor).
   function reset() {
     setActive(null);
     setResults([]);
@@ -897,8 +876,7 @@ function MentionSuggestions({ results, activeIndex, onPick, onHover }) {
           aria-selected={i === activeIndex}
           className={`cc-mention-suggestion${i === activeIndex ? ' is-active' : ''}`}
           onMouseEnter={() => onHover(i)}
-          // mousedown (not click) fires before the textarea's blur, so the
-          // caret/selection state used by pick() is still valid.
+          // mousedown fires before blur, so pick()'s caret read is still valid.
           onMouseDown={(e) => { e.preventDefault(); onPick(person); }}
         >
           <Avatar src={person.avatar} alt="" size={20} />
@@ -927,14 +905,9 @@ function MentionChips({ mentions, onRemove }) {
 }
 
 // ── Thread assignee ──────────────────────────────────────────────────────────
-//
-// QA-hands-off-to-dev: an optional single assignee on the thread, same
-// Slack-directory picker as @-mentions (cc:api:searchPeople) but standalone
-// rather than triggered inline in a text field, so it uses a plain
-// SearchField + suggestion list instead of the mention picker's caret
-// tracking. Persists via cc:api:patchThread's `assignee` field (see
-// milo-logs-deploy's threads.js updateThread — intentionally NOT
-// ownership-gated, unlike status).
+// Same Slack-directory search as @-mentions, but a standalone SearchField (no
+// caret to track). Persists via patchThread's `assignee` field — not
+// ownership-gated, unlike status.
 function AssigneePicker({ thread, onUpdate, onError }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -943,9 +916,8 @@ function AssigneePicker({ thread, onUpdate, onError }) {
 
   useEffect(() => {
     if (!open) return undefined;
-    // Skip the round trip on an empty query (opening the picker fires this
-    // effect immediately, before any typing) — the backend rejects an empty
-    // q with [] anyway, so there's nothing to fetch yet.
+    // Opening the picker fires this before any typing — skip the round trip
+    // on an empty query, same as the mention picker.
     if (!query.trim()) { setResults([]); return undefined; }
     let cancelled = false;
     const timer = setTimeout(async () => {

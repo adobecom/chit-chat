@@ -343,9 +343,7 @@ html, body {
   position: relative;
 }
 
-/* Selected-mentions chip row (S2 TagGroup) — sits above the compose field
-   when composing, or below the body when rendered read-only. No other
-   styling needed; TagGroup brings its own theme-aware chip look. */
+/* Selected-mentions chip row (TagGroup) above the compose field, or below a rendered body. */
 .cc-mention-chips {
   margin-bottom: 6px;
 }
