@@ -117,9 +117,18 @@ if (window.__chitChatLoaded) {
       .cc-dot[data-status="hidden"] { display: none; }
       .cc-dot[data-status="unanchored"] { opacity: .25; filter: grayscale(1); }
       /* Uncertain (fuzzy tag-wide text match) rather than a confident
-         selector/XPath hit — distinct from, and layered independently of,
-         the viewport-visibility dimming above. */
+         selector/XPath hit — distinct from the viewport-visibility dimming
+         above, but both drive opacity, so they can't just be declared
+         independently: on equal specificity CSS lets whichever rule comes
+         later in the stylesheet win outright, silently erasing the other
+         (exactly the failure mode data-status/data-confidence's separation
+         from the border-color classes was meant to avoid — just one level
+         up, between these two new rules instead of the old ones). The
+         combined selector below has higher specificity than either alone,
+         so a dot that's both off-screen AND an uncertain match gets its own
+         (lower) opacity instead of one signal clobbering the other. */
       .cc-dot[data-confidence="approximate"] { opacity: .7; }
+      .cc-dot[data-status="offscreen"][data-confidence="approximate"] { opacity: .25; }
       /* element-picker highlight overlay */
       #cc-element-picker { position: fixed; inset: 0; z-index: 2147483641;
                            pointer-events: none; }
