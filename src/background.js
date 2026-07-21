@@ -7,8 +7,17 @@
  *      The manifest "key" pins the extension ID to nafgnogpgkcheonjkjjdfjjhnhllbkdh so
  *      the chromiumapp.org redirect URI stays stable across stage and prod IMS clients.
  *   3. All /annotations network requests (host_permissions bypass CORS here).
+ *      Endpoint paths + request payload shapes come from
+ *      @adobe/annotations-core's contract.js (shared with milo-logs-deploy's
+ *      api.js) — only the transport below (fetch + Bearer/chrome.identity) is
+ *      local to this extension.
  *   4. Message broker between the side panel and the active tab's content script.
  */
+
+import {
+  threadsPath, threadsListPath, threadPath, commentsPath, commentPath, votePath, peoplePath,
+  createThreadBody, patchThreadBody, createCommentBody, patchCommentBody, voteBody,
+} from '@adobe/annotations-core/contract';
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -265,56 +274,54 @@ async function handleMessage(msg, sender) {
     // Background polls set msg.background so an expired token surfaces as
     // SESSION_EXPIRED instead of triggering an unprompted interactive sign-in.
     return apiRequest(
-      `/threads?page_url=${encodeURIComponent(msg.pageUrl)}`,
+      threadsListPath(msg.pageUrl),
       {}, true, { interactive: !msg.background },
     );
   }
   if (type === 'cc:api:createThread') {
-    return apiRequest('/threads', {
+    return apiRequest(threadsPath(), {
       method: 'POST',
-      body: JSON.stringify({ page_url: msg.pageUrl, anchor: msg.anchor }),
+      body: JSON.stringify(createThreadBody(msg.pageUrl, msg.anchor)),
     });
   }
   if (type === 'cc:api:patchThread') {
-    return apiRequest(`/threads/${msg.id}`, {
+    return apiRequest(threadPath(msg.id), {
       method: 'PATCH',
-      body: JSON.stringify(msg.data),
+      body: JSON.stringify(patchThreadBody(msg.data)),
     });
   }
   if (type === 'cc:api:deleteThread') {
-    return apiRequest(`/threads/${msg.id}`, { method: 'DELETE' });
+    return apiRequest(threadPath(msg.id), { method: 'DELETE' });
   }
   if (type === 'cc:api:createComment') {
-    return apiRequest('/comments', {
+    return apiRequest(commentsPath(), {
       method: 'POST',
-      body: JSON.stringify({
-        thread_id: msg.threadId, body: msg.body, author_name: msg.authorName, mentions: msg.mentions ?? [],
-      }),
+      body: JSON.stringify(createCommentBody(msg.threadId, msg.body, {
+        authorName: msg.authorName, mentions: msg.mentions ?? [],
+      })),
     });
   }
   if (type === 'cc:api:patchComment') {
     // Field absent = leave unchanged, field present = replace (see
     // updateComment in milo-logs-deploy's comments.js).
-    const body = { body: msg.body };
-    if (msg.mentions !== undefined) body.mentions = msg.mentions;
-    return apiRequest(`/comments/${msg.id}`, {
+    return apiRequest(commentPath(msg.id), {
       method: 'PATCH',
-      body: JSON.stringify(body),
+      body: JSON.stringify(patchCommentBody(msg.body, { mentions: msg.mentions })),
     });
   }
   if (type === 'cc:api:deleteComment') {
-    return apiRequest(`/comments/${msg.id}`, { method: 'DELETE' });
+    return apiRequest(commentPath(msg.id), { method: 'DELETE' });
   }
   if (type === 'cc:api:voteComment') {
-    return apiRequest(`/comments/${msg.id}/vote`, {
+    return apiRequest(votePath(msg.id), {
       method: 'POST',
-      body: JSON.stringify({ upvoteDelta: msg.upvoteDelta ?? 0, downvoteDelta: msg.downvoteDelta ?? 0 }),
+      body: JSON.stringify(voteBody({ upvoteDelta: msg.upvoteDelta ?? 0, downvoteDelta: msg.downvoteDelta ?? 0 })),
     });
   }
   // @-mention/assignee picker search (see milo-logs-deploy's people.js). Fires
   // on every keystroke, so a stale token should fail quietly, not pop a sign-in window.
   if (type === 'cc:api:searchPeople') {
-    return apiRequest(`/people?q=${encodeURIComponent(msg.q ?? '')}`, {}, true, { interactive: false });
+    return apiRequest(peoplePath(msg.q), {}, true, { interactive: false });
   }
 
   // ── Auth ────────────────────────────────────────────────────────────────

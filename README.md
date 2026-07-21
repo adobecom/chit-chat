@@ -41,7 +41,7 @@ Sign-in uses `chrome.identity.launchWebAuthFlow` — no relay page required. The
 
 ## Anchor format compatibility
 
-`captureAnchor` / `resolveAnchor` in the content script produce the same JSON shape as the original page-commenter bundle (`cssSelector`, `xpath`, `textContent`, `boundingRect`, `tagName`, `textSelectionStart/End`). Shape anchors use `{ type:'shape', shape:'rect'|'ellipse', x, y, width, height }`. Threads created by either client are interoperable.
+`captureAnchor` / `resolveAnchor` come from `@adobe/annotations-core`, shared with the milo-logs-deploy page-commenter bundle, so both clients agree on the anchor JSON shape (`cssSelector`, `xpath`, `textContent`, `boundingRect`, `tagName`, `textSelectionStart/End`) and the resolution cascade's confidence thresholds. Shape anchors use `{ type:'shape', shape:'rect'|'ellipse', left, top, width, height }` (absolute document coordinates, not `x`/`y`). Both element/text and shape anchors also carry `viewportWidth` (and shape anchors `scrollY`), added at save time via the package's `finalizeAnchorForSave`. Threads created by either client are interoperable.
 
 ## Architecture
 

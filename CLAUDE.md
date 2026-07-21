@@ -37,8 +37,8 @@ Central message router and API proxy. Key responsibilities:
 
 Runs in the `MAIN` world so it has live DOM access. Key responsibilities:
 - **Annotation modes**: element-picker (click-to-comment), rect-draw, ellipse-draw, text-selection "+Comment" button
-- **Anchor capture**: `captureAnchor()` records CSS selector, XPath, text content, bounding rect, tag, alt, src
-- **Anchor resolution**: `resolveAnchor()` cascade — CSS selector → XPath → fuzzy Levenshtein text match
+- **Anchor capture**: `captureAnchor()` (from `@adobe/annotations-core/anchor`) records CSS selector, XPath, text content, bounding rect, tag, alt, src
+- **Anchor resolution**: `resolveAnchor()` (same package) cascade — CSS selector → XPath → fuzzy Levenshtein text match
 - **Overlay markers**: dot markers pinned over resolved elements; shape markers (rect/ellipse) for region annotations
 - **SPA navigation**: patches `history.pushState/replaceState` and listens to `popstate`/`hashchange`; debounced `MutationObserver` re-resolves orphaned anchors after DOM mutations
 
@@ -79,4 +79,4 @@ S2's `style()` macro (`@react-spectrum/s2/style` with `{ type: 'macro' }`) is av
 - `CLIENT_ID = 'milo-logs-claude-mcp'`
 - `SCOPES = 'AdobeID,openid,profile,email'`
 - Extension ID: `nafgnogpgkcheonjkjjdfjjhnhllbkdh` (pinned by manifest `key`)
-- Annotation anchor format is compatible with the original Milo page-commenter bookmarklet
+- Anchor capture/resolution, HTML sanitization, and the `/annotations` endpoint contract come from `@adobe/annotations-core` (an npm dependency whose source of truth is `milo-logs-deploy`'s `packages/annotations-core`), shared with the milo-logs-deploy page-commenter bundle — not hand-kept-in-sync, so anchor format compatibility is structural rather than a convention to maintain

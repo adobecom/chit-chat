@@ -4,8 +4,9 @@
  * Runs in the ISOLATED world (Chrome's default for content scripts) so that
  * chrome.runtime messaging works correctly.
  * Owns everything that requires live host-DOM access:
- *   - Anchor capture (same JSON shape as the original page-commenter so stored
- *     threads stay resolvable) and resolution cascade
+ *   - Anchor capture/resolution — from @adobe/annotations-core, shared with
+ *     milo-logs-deploy's page-commenter client so stored threads stay
+ *     resolvable across both.
  *   - Overlay: dot markers + shape markers
  *   - Element-picker mode, shape-draw mode, text-selection button
  *   - Scroll-to-thread / flash
@@ -20,6 +21,27 @@
  *
  * Guard against double-injection.
  */
+import { captureAnchor, resolveAnchor, finalizeAnchorForSave } from '@adobe/annotations-core/anchor';
+import { STATUS_COLORS } from '@adobe/annotations-core/colors';
+import { resolveMarkerPlacement, resolveShapePlacement } from '@adobe/annotations-core/marker-geometry';
+
+// Markers render on the host page, not inside chit-chat's own themed side
+// panel — its light/dark contrast needs depend on the host page's own
+// background, unrelated to the extension's panel-theme preference. The
+// overlay's injected stylesheet has never been theme-reactive (unlike the
+// shadow-root-scoped compose/picker UI, which toggles a `.cc-dark` class),
+// so use the light variant unconditionally rather than inventing new
+// theme-reactive infra a color-value fix doesn't call for.
+const OPEN_COLOR = STATUS_COLORS.open.light;
+const IN_PROGRESS_COLOR = STATUS_COLORS.in_progress.light;
+const RESOLVED_COLOR = STATUS_COLORS.resolved.light;
+
+// Translucent fill for shape markers — same status color, alpha-blended.
+function withAlpha(hex, alpha) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
 if (window.__chitChatLoaded) {
   // already running — ignore
 } else {
@@ -46,137 +68,6 @@ if (window.__chitChatLoaded) {
     send('cc:panel:forward', { payload: { type, ...payload } });
   }
 
-  // ── Levenshtein / text similarity ─────────────────────────────────────────
-
-  function levenshtein(a, b) {
-    if (a === b) return 0;
-    const la = a.length; const lb = b.length;
-    if (!la) return lb; if (!lb) return la;
-    const dp = Array.from({ length: la + 1 }, (_, i) => i);
-    for (let j = 1; j <= lb; j++) {
-      let prev = dp[0]; dp[0] = j;
-      for (let i = 1; i <= la; i++) {
-        const tmp = dp[i];
-        dp[i] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, dp[i], dp[i - 1]);
-        prev = tmp;
-      }
-    }
-    return dp[la];
-  }
-
-  function textSimilarity(a, b) {
-    if (!a && !b) return 1;
-    if (!a || !b) return 0;
-    const as = a.slice(0, 512); const bs = b.slice(0, 512);
-    return 1 - levenshtein(as, bs) / Math.max(as.length, bs.length);
-  }
-
-  // ── CSS selector / XPath builders ─────────────────────────────────────────
-
-  function buildSelector(el) {
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.documentElement) {
-      let seg = node.tagName.toLowerCase();
-      if (node.id) { seg += `#${CSS.escape(node.id)}`; parts.unshift(seg); break; }
-      const parent = node.parentElement;
-      if (parent) {
-        const sameTag = [...parent.children].filter((c) => c.tagName === node.tagName);
-        if (sameTag.length > 1) seg += `:nth-child(${[...parent.children].indexOf(node) + 1})`;
-      }
-      parts.unshift(seg);
-      node = node.parentElement;
-    }
-    return parts.join(' > ');
-  }
-
-  function buildXPath(el) {
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE) {
-      const tag = node.tagName.toLowerCase();
-      const parent = node.parentElement;
-      let idx = 1;
-      if (parent) for (const s of parent.children) { if (s === node) break; if (s.tagName === node.tagName) idx++; }
-      parts.unshift(`${tag}[${idx}]`);
-      node = parent;
-    }
-    return `/${parts.join('/')}`;
-  }
-
-  // ── Anchor capture ─────────────────────────────────────────────────────────
-  // Produces the same JSON shape as the original anchor.js so stored threads
-  // still resolve on the old bookmarklet client and vice-versa.
-
-  function captureAnchor(el, selection) {
-    const rect = el.getBoundingClientRect();
-    const anchor = {
-      cssSelector: buildSelector(el),
-      xpath: buildXPath(el),
-      textContent: el.textContent || '',
-      boundingRect: {
-        top: Math.round(rect.top + window.scrollY),
-        left: Math.round(rect.left + window.scrollX),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-      },
-      tagName: el.tagName,
-    };
-    if (selection && selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      const pre = document.createRange();
-      pre.setStart(el, 0);
-      pre.setEnd(range.startContainer, range.startOffset);
-      anchor.textSelectionStart = pre.toString().length;
-      anchor.textSelectionEnd = anchor.textSelectionStart + range.toString().length;
-    }
-    if (el.tagName === 'IMG') { anchor.altText = el.alt || null; anchor.src = el.currentSrc || el.src || null; }
-    if (el.tagName === 'PICTURE') {
-      const img = el.querySelector('img');
-      anchor.altText = img?.alt || null; anchor.src = img?.currentSrc || img?.src || null;
-    }
-    if (el.tagName === 'VIDEO') {
-      anchor.src = el.currentSrc || el.src || el.querySelector('source')?.src || null;
-      anchor.poster = el.poster || null;
-    }
-    return anchor;
-  }
-
-  // ── Anchor resolution cascade ──────────────────────────────────────────────
-
-  function resolveAnchor(anchor) {
-    if (!anchor || anchor.type === 'shape') return { element: null, status: 'unanchored' };
-    const { cssSelector, xpath, textContent, tagName } = anchor;
-    let structurallyFound = false;
-    try {
-      const el = document.querySelector(cssSelector);
-      if (el) {
-        structurallyFound = true;
-        if (textSimilarity(el.textContent, textContent) >= 0.8) return { element: el, status: 'resolved' };
-      }
-    } catch { /* invalid selector */ }
-    try {
-      const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-      if (el) {
-        structurallyFound = true;
-        if (textSimilarity(el.textContent, textContent) >= 0.8) return { element: el, status: 'resolved' };
-      }
-    } catch { /* invalid xpath */ }
-    if (structurallyFound && tagName) {
-      let best = null; let bestScore = 0;
-      for (const el of document.getElementsByTagName(tagName)) {
-        const score = textSimilarity(el.textContent, textContent);
-        if (score > bestScore) { bestScore = score; best = el; }
-      }
-      // Cap at 'approximate': we reached the tag-wide text scan only because the
-      // structural (CSS/XPath) match failed its text check, so a text-only hit
-      // among possibly-identical siblings must not be reported as a confident
-      // 'resolved' — that would place the marker on the wrong element silently.
-      if (best && bestScore >= 0.5) return { element: best, status: 'approximate' };
-    }
-    return { element: null, status: 'unanchored' };
-  }
-
   // ── Overlay container ──────────────────────────────────────────────────────
 
   const OWN_IDS = new Set(['cc-overlay', 'cc-element-picker', 'cc-snap-preview', 'cc-compose']);
@@ -200,17 +91,44 @@ if (window.__chitChatLoaded) {
                 font: bold 10px/1 sans-serif; color: #fff;
                 border: 2px solid #fff; box-sizing: border-box; }
       .cc-dot:hover { transform: translate(-50%,-50%) scale(1.2); }
-      /* Status ring colors (background is now per-user, set inline) */
-      .cc-dot--open        { border-color: #0265DC; }
-      .cc-dot--in_progress { border-color: #E68619; }
-      .cc-dot--resolved    { border-color: #2D9D78; }
-      .cc-dot--approximate { border-color: #E68619; }
+      /* Status ring colors (background is now per-user, set inline). Sourced
+         from @adobe/annotations-core/colors — the same S2 semantic values
+         this extension's own status badge already uses (open/notice,
+         in_progress/informative, resolved/positive), so the marker no longer
+         contradicts its own badge. */
+      .cc-dot--open        { border-color: ${OPEN_COLOR}; }
+      .cc-dot--in_progress { border-color: ${IN_PROGRESS_COLOR}; }
+      .cc-dot--resolved    { border-color: ${RESOLVED_COLOR}; }
       .cc-shape { position: absolute; pointer-events: all; cursor: pointer;
-                  border: 2px solid #0265DC; background: rgba(2,101,220,.08);
+                  border: 2px solid ${OPEN_COLOR}; background: ${withAlpha(OPEN_COLOR, 0.08)};
                   box-sizing: border-box; }
       .cc-shape--ellipse { border-radius: 50%; }
-      .cc-shape--in_progress { border-color: #E68619; background: rgba(230,134,25,.08); }
-      .cc-shape--resolved    { border-color: #2D9D78; background: rgba(45,157,120,.08); }
+      .cc-shape--in_progress { border-color: ${IN_PROGRESS_COLOR}; background: ${withAlpha(IN_PROGRESS_COLOR, 0.08)}; }
+      .cc-shape--resolved    { border-color: ${RESOLVED_COLOR}; background: ${withAlpha(RESOLVED_COLOR, 0.08)}; }
+      /* Anchor-resolution dimming — a separate visual channel (opacity/
+         filter) from the workflow-status border-color rules above, so the
+         two independent signals (workflow status vs. anchor-match
+         confidence) can't fight over the same CSS property. data-status
+         mirrors milo-logs-deploy's DotMarker.js/ShapeMarker.js convention
+         exactly (this repo's markers had no viewport-visibility distinction
+         at all before — every dot rendered full-opacity regardless of
+         whether its element was actually on-screen, or even resolved). */
+      .cc-dot[data-status="offscreen"], .cc-shape[data-status="offscreen"] { opacity: .35; }
+      .cc-dot[data-status="hidden"] { display: none; }
+      .cc-dot[data-status="unanchored"] { opacity: .25; filter: grayscale(1); }
+      /* Uncertain (fuzzy tag-wide text match) rather than a confident
+         selector/XPath hit — distinct from the viewport-visibility dimming
+         above, but both drive opacity, so they can't just be declared
+         independently: on equal specificity CSS lets whichever rule comes
+         later in the stylesheet win outright, silently erasing the other
+         (exactly the failure mode data-status/data-confidence's separation
+         from the border-color classes was meant to avoid — just one level
+         up, between these two new rules instead of the old ones). The
+         combined selector below has higher specificity than either alone,
+         so a dot that's both off-screen AND an uncertain match gets its own
+         (lower) opacity instead of one signal clobbering the other. */
+      .cc-dot[data-confidence="approximate"] { opacity: .7; }
+      .cc-dot[data-status="offscreen"][data-confidence="approximate"] { opacity: .25; }
       /* element-picker highlight overlay */
       #cc-element-picker { position: fixed; inset: 0; z-index: 2147483641;
                            pointer-events: none; }
@@ -351,8 +269,12 @@ if (window.__chitChatLoaded) {
       if (!res) continue;
       if (t.anchor?.type === 'shape') {
         renderShapeMarker(overlay, t);
-      } else if (res.element) {
-        renderDotMarker(overlay, t, res.element);
+      } else {
+        // Render even when res.element is null (anchor didn't resolve) —
+        // resolveMarkerPlacement falls back to the anchor's stored
+        // boundingRect and reports 'unanchored', so the dot still shows up
+        // (dimmed/grayscale) instead of silently vanishing from the overlay.
+        renderDotMarker(overlay, t, res);
       }
     }
   }
@@ -412,28 +334,37 @@ if (window.__chitChatLoaded) {
     return dot;
   }
 
-  function renderDotMarker(overlay, thread, el) {
-    const rect = el.getBoundingClientRect();
+  // `res` is resolveAnchor's { element, status } — element may be null
+  // (anchor never resolved to anything; resolveMarkerPlacement falls back to
+  // the anchor's stored boundingRect for a static position). status is the
+  // anchor-match confidence (resolved/approximate/unanchored), independent
+  // of dataset.status below (viewport visibility) — approximate gets its own
+  // lighter dim via data-confidence so the two signals don't fight over the
+  // same visual channel.
+  function renderDotMarker(overlay, thread, res) {
+    const placement = resolveMarkerPlacement(res.element, thread.anchor);
     const dot = createCommenterDot(thread);
-    // Overlay is position:fixed — use viewport coords directly (no scroll offset).
-    dot.style.left = `${rect.left + rect.width / 2}px`;
-    dot.style.top = `${rect.top}px`;
+    // Overlay is position:fixed — placement.left/top are already viewport coords.
+    dot.style.left = `${placement.left + placement.width / 2}px`;
+    dot.style.top = `${placement.top}px`;
+    dot.dataset.status = placement.status;
+    if (res.status === 'approximate') dot.dataset.confidence = 'approximate';
     overlay.appendChild(dot);
   }
 
   function renderShapeMarker(overlay, thread) {
     const a = thread.anchor;
+    const placement = resolveShapePlacement(a);
     const shape = document.createElement('div');
     const statusMod = (thread.status === 'in_progress' || thread.status === 'resolved')
       ? ` cc-shape--${thread.status}` : '';
     shape.className = `cc-shape${a.shape === 'ellipse' ? ' cc-shape--ellipse' : ''}${statusMod}`;
-    // Shape anchors are stored as page (document) coordinates. Overlay is
-    // position:fixed, so subtract scroll to convert to viewport coordinates.
-    shape.style.left = `${a.left - window.scrollX}px`;
-    shape.style.top = `${a.top - window.scrollY}px`;
-    shape.style.width = `${a.width}px`;
-    shape.style.height = `${a.height}px`;
+    shape.style.left = `${placement.left}px`;
+    shape.style.top = `${placement.top}px`;
+    shape.style.width = `${placement.width}px`;
+    shape.style.height = `${placement.height}px`;
     shape.dataset.threadId = thread.id;
+    shape.dataset.status = placement.status;
     shape.addEventListener('click', () => toPanel('cc:panel:dotClicked', { threadId: thread.id }));
     overlay.appendChild(shape);
 
@@ -454,22 +385,24 @@ if (window.__chitChatLoaded) {
     if (!overlay) return;
     for (const dot of overlay.querySelectorAll('.cc-dot')) {
       const tid = dot.dataset.threadId;
+      // dataset values are always strings; stringify the id so numeric backend
+      // ids still match threads found by object key elsewhere.
+      const t = _threads.find((x) => String(x.id) === tid);
+      if (!t?.anchor) continue;
       const res = _resolvedMap[tid];
-      if (!res?.element) continue;
-      const rect = res.element.getBoundingClientRect();
-      dot.style.left = `${rect.left + rect.width / 2}px`;
-      dot.style.top = `${rect.top}px`;
+      const placement = resolveMarkerPlacement(res?.element ?? null, t.anchor);
+      dot.style.left = `${placement.left + placement.width / 2}px`;
+      dot.style.top = `${placement.top}px`;
+      dot.dataset.status = placement.status;
     }
     for (const shape of overlay.querySelectorAll('.cc-shape')) {
       const tid = shape.dataset.threadId;
-      // dataset values are always strings; stringify the id so numeric backend
-      // ids still match (otherwise shapes freeze at their initial position on
-      // scroll while dot markers — which look up by object key — track fine).
       const t = _threads.find((x) => String(x.id) === tid);
       if (!t?.anchor) continue;
-      const a = t.anchor;
-      shape.style.left = `${a.left - window.scrollX}px`;
-      shape.style.top = `${a.top - window.scrollY}px`;
+      const placement = resolveShapePlacement(t.anchor);
+      shape.style.left = `${placement.left}px`;
+      shape.style.top = `${placement.top}px`;
+      shape.dataset.status = placement.status;
     }
   }
 
@@ -964,8 +897,9 @@ if (window.__chitChatLoaded) {
       if (!url) return;
       editable.focus();
       restoreRange();
-      // safeMediaUrl (sanitize.js) re-validates the scheme at render time
-      // regardless — this is just so an obviously-bad scheme isn't authored.
+      // safeMediaUrl (@adobe/annotations-core/sanitize) re-validates the scheme
+      // at render time regardless — this is just so an obviously-bad scheme
+      // isn't authored.
       if (/^\s*(javascript|data|vbscript):/i.test(url)) return;
       if (window.getSelection()?.isCollapsed) {
         document.execCommand('insertHTML', false, `<a href="${url.replace(/"/g, '&quot;')}">${url.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</a>`);
@@ -1090,8 +1024,12 @@ if (window.__chitChatLoaded) {
     const save = document.createElement('button');
     save.className = 'cc-compose-save'; save.textContent = 'Post';
     save.addEventListener('click', () => {
-      const text = editable.textContent.trim();
-      if (!text) return;
+      // textContent is blind to <img> (a pasted screenshot with no caption
+      // text) — same emptiness pitfall as the side panel's Quill boxes, fixed
+      // there via an embed-aware check; mirrored here for this dependency-free
+      // contenteditable.
+      const isEmpty = !editable.textContent.trim() && !editable.querySelector('img');
+      if (isEmpty) return;
       const body = editable.innerHTML;
       if (body.length > MAX_COMPOSE_BODY_CHARS) {
         hint.textContent = 'That comment is too large to post — try a smaller or cropped screenshot.';
@@ -1100,7 +1038,7 @@ if (window.__chitChatLoaded) {
       }
       closeCompose();
       toPanel('cc:panel:anchorCaptured', {
-        anchor,
+        anchor: finalizeAnchorForSave(anchor),
         body,
         pageUrl: window.location.origin + window.location.pathname,
       });
