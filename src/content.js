@@ -963,8 +963,12 @@ if (window.__chitChatLoaded) {
     const save = document.createElement('button');
     save.className = 'cc-compose-save'; save.textContent = 'Post';
     save.addEventListener('click', () => {
-      const text = editable.textContent.trim();
-      if (!text) return;
+      // textContent is blind to <img> (a pasted screenshot with no caption
+      // text) — same emptiness pitfall as the side panel's Quill boxes, fixed
+      // there via an embed-aware check; mirrored here for this dependency-free
+      // contenteditable.
+      const isEmpty = !editable.textContent.trim() && !editable.querySelector('img');
+      if (isEmpty) return;
       const body = editable.innerHTML;
       if (body.length > MAX_COMPOSE_BODY_CHARS) {
         hint.textContent = 'That comment is too large to post — try a smaller or cropped screenshot.';

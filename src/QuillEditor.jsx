@@ -208,20 +208,18 @@ const QuillEditor = forwardRef(function QuillEditor(
       // getLength() alone can't stand in for a plain whitespace/trim check
       // when there's no embed (a single space or a bare Enter both make
       // getLength() >= 2 despite having nothing meaningful to post).
-      const reportEmpty = () => {
+      const report = (caretIndex) => {
         const { text, hasEmbed } = analyzeContents(q);
         onEmptyChange?.(!hasEmbed && !text.trim());
+        onCaretChange?.(text, caretIndex);
       };
-      reportEmpty();
-      q.on('text-change', () => {
-        reportEmpty();
-        onCaretChange?.(analyzeContents(q).text, q.getSelection()?.index ?? null);
-      });
+      report(q.getSelection()?.index ?? null);
+      q.on('text-change', () => report(q.getSelection()?.index ?? null));
       // Also fires on caret moves that don't change text (click, arrow keys) —
       // needed so opening/closing the mention popover tracks cursor position,
       // not just edits. Range is null on blur, which closes the popover.
       q.on('selection-change', (range) => {
-        onCaretChange?.(analyzeContents(q).text, range ? range.index : null);
+        report(range ? range.index : null);
       });
       if (autoFocus) q.focus();
 
