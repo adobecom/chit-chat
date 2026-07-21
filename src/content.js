@@ -4,8 +4,9 @@
  * Runs in the ISOLATED world (Chrome's default for content scripts) so that
  * chrome.runtime messaging works correctly.
  * Owns everything that requires live host-DOM access:
- *   - Anchor capture (same JSON shape as the original page-commenter so stored
- *     threads stay resolvable) and resolution cascade
+ *   - Anchor capture/resolution — from @adobe/annotations-core, shared with
+ *     milo-logs-deploy's page-commenter client so stored threads stay
+ *     resolvable across both.
  *   - Overlay: dot markers + shape markers
  *   - Element-picker mode, shape-draw mode, text-selection button
  *   - Scroll-to-thread / flash
@@ -20,6 +21,8 @@
  *
  * Guard against double-injection.
  */
+import { captureAnchor, resolveAnchor, finalizeAnchorForSave } from '@adobe/annotations-core/anchor';
+
 if (window.__chitChatLoaded) {
   // already running — ignore
 } else {
@@ -44,137 +47,6 @@ if (window.__chitChatLoaded) {
   /** postMessage-safe wrapper to tell the panel something. */
   function toPanel(type, payload = {}) {
     send('cc:panel:forward', { payload: { type, ...payload } });
-  }
-
-  // ── Levenshtein / text similarity ─────────────────────────────────────────
-
-  function levenshtein(a, b) {
-    if (a === b) return 0;
-    const la = a.length; const lb = b.length;
-    if (!la) return lb; if (!lb) return la;
-    const dp = Array.from({ length: la + 1 }, (_, i) => i);
-    for (let j = 1; j <= lb; j++) {
-      let prev = dp[0]; dp[0] = j;
-      for (let i = 1; i <= la; i++) {
-        const tmp = dp[i];
-        dp[i] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, dp[i], dp[i - 1]);
-        prev = tmp;
-      }
-    }
-    return dp[la];
-  }
-
-  function textSimilarity(a, b) {
-    if (!a && !b) return 1;
-    if (!a || !b) return 0;
-    const as = a.slice(0, 512); const bs = b.slice(0, 512);
-    return 1 - levenshtein(as, bs) / Math.max(as.length, bs.length);
-  }
-
-  // ── CSS selector / XPath builders ─────────────────────────────────────────
-
-  function buildSelector(el) {
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.documentElement) {
-      let seg = node.tagName.toLowerCase();
-      if (node.id) { seg += `#${CSS.escape(node.id)}`; parts.unshift(seg); break; }
-      const parent = node.parentElement;
-      if (parent) {
-        const sameTag = [...parent.children].filter((c) => c.tagName === node.tagName);
-        if (sameTag.length > 1) seg += `:nth-child(${[...parent.children].indexOf(node) + 1})`;
-      }
-      parts.unshift(seg);
-      node = node.parentElement;
-    }
-    return parts.join(' > ');
-  }
-
-  function buildXPath(el) {
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE) {
-      const tag = node.tagName.toLowerCase();
-      const parent = node.parentElement;
-      let idx = 1;
-      if (parent) for (const s of parent.children) { if (s === node) break; if (s.tagName === node.tagName) idx++; }
-      parts.unshift(`${tag}[${idx}]`);
-      node = parent;
-    }
-    return `/${parts.join('/')}`;
-  }
-
-  // ── Anchor capture ─────────────────────────────────────────────────────────
-  // Produces the same JSON shape as the original anchor.js so stored threads
-  // still resolve on the old bookmarklet client and vice-versa.
-
-  function captureAnchor(el, selection) {
-    const rect = el.getBoundingClientRect();
-    const anchor = {
-      cssSelector: buildSelector(el),
-      xpath: buildXPath(el),
-      textContent: el.textContent || '',
-      boundingRect: {
-        top: Math.round(rect.top + window.scrollY),
-        left: Math.round(rect.left + window.scrollX),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-      },
-      tagName: el.tagName,
-    };
-    if (selection && selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      const pre = document.createRange();
-      pre.setStart(el, 0);
-      pre.setEnd(range.startContainer, range.startOffset);
-      anchor.textSelectionStart = pre.toString().length;
-      anchor.textSelectionEnd = anchor.textSelectionStart + range.toString().length;
-    }
-    if (el.tagName === 'IMG') { anchor.altText = el.alt || null; anchor.src = el.currentSrc || el.src || null; }
-    if (el.tagName === 'PICTURE') {
-      const img = el.querySelector('img');
-      anchor.altText = img?.alt || null; anchor.src = img?.currentSrc || img?.src || null;
-    }
-    if (el.tagName === 'VIDEO') {
-      anchor.src = el.currentSrc || el.src || el.querySelector('source')?.src || null;
-      anchor.poster = el.poster || null;
-    }
-    return anchor;
-  }
-
-  // ── Anchor resolution cascade ──────────────────────────────────────────────
-
-  function resolveAnchor(anchor) {
-    if (!anchor || anchor.type === 'shape') return { element: null, status: 'unanchored' };
-    const { cssSelector, xpath, textContent, tagName } = anchor;
-    let structurallyFound = false;
-    try {
-      const el = document.querySelector(cssSelector);
-      if (el) {
-        structurallyFound = true;
-        if (textSimilarity(el.textContent, textContent) >= 0.8) return { element: el, status: 'resolved' };
-      }
-    } catch { /* invalid selector */ }
-    try {
-      const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-      if (el) {
-        structurallyFound = true;
-        if (textSimilarity(el.textContent, textContent) >= 0.8) return { element: el, status: 'resolved' };
-      }
-    } catch { /* invalid xpath */ }
-    if (structurallyFound && tagName) {
-      let best = null; let bestScore = 0;
-      for (const el of document.getElementsByTagName(tagName)) {
-        const score = textSimilarity(el.textContent, textContent);
-        if (score > bestScore) { bestScore = score; best = el; }
-      }
-      // Cap at 'approximate': we reached the tag-wide text scan only because the
-      // structural (CSS/XPath) match failed its text check, so a text-only hit
-      // among possibly-identical siblings must not be reported as a confident
-      // 'resolved' — that would place the marker on the wrong element silently.
-      if (best && bestScore >= 0.5) return { element: best, status: 'approximate' };
-    }
-    return { element: null, status: 'unanchored' };
   }
 
   // ── Overlay container ──────────────────────────────────────────────────────
@@ -1100,7 +972,7 @@ if (window.__chitChatLoaded) {
       }
       closeCompose();
       toPanel('cc:panel:anchorCaptured', {
-        anchor,
+        anchor: finalizeAnchorForSave(anchor),
         body,
         pageUrl: window.location.origin + window.location.pathname,
       });

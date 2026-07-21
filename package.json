@@ -11,6 +11,7 @@
     "package": "npm run build && rm -f chit-chat-extension.zip && zip -rq chit-chat-extension.zip manifest.json sidepanel.html dist icons"
   },
   "dependencies": {
+    "@adobe/annotations-core": "^0.1.0",
     "@react-spectrum/s2": "^1.4.0",
     "dompurify": "^3.4.12",
     "quill": "^2.0.3",

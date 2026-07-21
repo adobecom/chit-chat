@@ -9,7 +9,7 @@ import { useEffect, useRef, useState, useImperativeHandle, forwardRef } from 're
 import { createPortal } from 'react-dom';
 import Quill from 'quill';
 import 'quill/dist/quill.snow.css';
-import { escAttr, stripHtml } from './sanitize.js';
+import { escAttr, stripHtml } from '@adobe/annotations-core/sanitize';
 import EmojiIcon from '@react-spectrum/s2/icons/Emoji';
 
 // Downscale pasted/inserted screenshots before embedding as base64 — full

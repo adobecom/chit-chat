@@ -39,7 +39,7 @@ import {
   Tag,
   Avatar,
 } from '@react-spectrum/s2';
-import { sanitizeHtml, stripHtml } from './sanitize.js';
+import { sanitizeHtml, stripHtml } from '@adobe/annotations-core/sanitize';
 import QuillEditor from './QuillEditor.jsx';
 import BrightnessContrastIcon from '@react-spectrum/s2/icons/BrightnessContrast';
 import ChevronLeftIcon from '@react-spectrum/s2/icons/ChevronLeft';
