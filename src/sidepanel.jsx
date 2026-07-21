@@ -814,6 +814,11 @@ function useMentionPicker(text, setText, mentions, setMentions) {
 
   useEffect(() => {
     if (!active) return undefined;
+    // The backend rejects an empty q with [] anyway (searchPeople's own early
+    // return) — skip the round trip entirely rather than debounce-then-fetch
+    // a result we already know is empty. Matters right after typing a bare
+    // "@" with nothing after it yet.
+    if (!active.query.trim()) { setResults([]); return undefined; }
     let cancelled = false;
     const timer = setTimeout(async () => {
       try {
@@ -938,6 +943,10 @@ function AssigneePicker({ thread, onUpdate, onError }) {
 
   useEffect(() => {
     if (!open) return undefined;
+    // Skip the round trip on an empty query (opening the picker fires this
+    // effect immediately, before any typing) — the backend rejects an empty
+    // q with [] anyway, so there's nothing to fetch yet.
+    if (!query.trim()) { setResults([]); return undefined; }
     let cancelled = false;
     const timer = setTimeout(async () => {
       try {
