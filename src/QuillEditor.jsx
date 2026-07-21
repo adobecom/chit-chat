@@ -57,6 +57,56 @@ function uploadHandler(range, files) {
     });
 }
 
+// Native Unicode emoji, inserted as plain text — no allow-list/sanitizer
+// changes needed. Duplicated in content.js for the same reason as above.
+const EMOJIS = ['👍', '👎', '😀', '😂', '🎉', '🔥', '👀', '✅', '❌', '⚠️', '🐛', '💡', '❓', '❤️', '🙏', '👏', '🚀', '💯', '😅', '🤔', '🙌', '✨', '📌', '⏳'];
+
+// Quill's array-based toolbar only renders buttons for built-in formats, so
+// the emoji picker is appended to the generated toolbar by hand rather than
+// through modules.toolbar. mousedown/preventDefault on every button keeps
+// focus (and Quill's last selection range) in the editor.
+function attachEmojiPicker(quill, toolbarEl) {
+  const wrap = document.createElement('span');
+  wrap.className = 'cc-emoji-wrap';
+
+  const popover = document.createElement('div');
+  popover.className = 'cc-emoji-popover';
+  popover.hidden = true;
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'cc-emoji-btn';
+  btn.textContent = '🙂';
+  btn.title = 'Insert emoji';
+  btn.setAttribute('aria-label', 'Insert emoji');
+  btn.addEventListener('mousedown', (e) => e.preventDefault());
+  btn.addEventListener('click', () => { popover.hidden = !popover.hidden; });
+  EMOJIS.forEach((emoji) => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'cc-emoji-item';
+    item.textContent = emoji;
+    item.setAttribute('aria-label', emoji);
+    item.addEventListener('mousedown', (e) => e.preventDefault());
+    item.addEventListener('click', () => {
+      const range = quill.getSelection() ?? { index: quill.getLength(), length: 0 };
+      quill.insertText(range.index, emoji, 'user');
+      quill.setSelection(range.index + emoji.length, 0, 'silent');
+      popover.hidden = true;
+    });
+    popover.appendChild(item);
+  });
+
+  function onDocClick(e) {
+    if (!wrap.contains(e.target)) popover.hidden = true;
+  }
+  document.addEventListener('click', onDocClick);
+
+  wrap.append(btn, popover);
+  toolbarEl.appendChild(wrap);
+  return () => document.removeEventListener('click', onDocClick);
+}
+
 const QuillEditor = forwardRef(function QuillEditor(
   {
     placeholder = 'Write a comment…',
@@ -94,6 +144,7 @@ const QuillEditor = forwardRef(function QuillEditor(
   useEffect(() => {
     const el = mountRef.current;
     if (!el) return;
+    let detachEmojiPicker;
 
     try {
       const q = new Quill(el, {
@@ -113,6 +164,9 @@ const QuillEditor = forwardRef(function QuillEditor(
       onEmptyChange?.(q.getText().trim().length === 0);
       q.on('text-change', () => onEmptyChange?.(q.getText().trim().length === 0));
       if (autoFocus) q.focus();
+
+      const toolbarEl = el.querySelector('.ql-toolbar');
+      if (toolbarEl) detachEmojiPicker = attachEmojiPicker(q, toolbarEl);
     } catch {
       // Fallback if Quill fails to construct (e.g. unexpected DOM state) —
       // keep the box usable as plain text rather than losing compose entirely.
@@ -121,6 +175,7 @@ const QuillEditor = forwardRef(function QuillEditor(
     }
 
     return () => {
+      detachEmojiPicker?.();
       quillRef.current = null;
     };
   }, []); // intentionally run once — this is an uncontrolled editor

@@ -302,6 +302,56 @@ html, body {
   box-sizing: border-box;
 }
 
+/* Emoji picker appended to Quill's toolbar (see QuillEditor.jsx). */
+.cc-emoji-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.cc-emoji-btn {
+  height: 24px;
+  width: 28px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  border-radius: 4px;
+}
+
+.cc-emoji-btn:hover {
+  background: light-dark(rgba(0, 0, 0, 0.06), rgba(255, 255, 255, 0.1));
+}
+
+.cc-emoji-popover {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 10;
+  margin-top: 4px;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 2px;
+  padding: 6px;
+  background: light-dark(#fff, #2a2a2a);
+  border: 1px solid light-dark(#ccc, #555);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.cc-emoji-item {
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.cc-emoji-item:hover {
+  background: light-dark(rgba(0, 0, 0, 0.08), rgba(255, 255, 255, 0.12));
+}
+
 .cc-edit-actions {
   display: flex;
   gap: 6px;

@@ -281,6 +281,11 @@ if (window.__chitChatLoaded) {
     .cc-compose-linkform input { flex: 1; min-width: 0; padding: 4px 6px; box-sizing: border-box;
                                  border: 1px solid #ccc; border-radius: 4px;
                                  font: 12px/1.4 -apple-system, sans-serif; }
+    .cc-compose-emojipopover { grid-template-columns: repeat(6, 1fr); gap: 2px; margin-bottom: 6px;
+                               padding: 6px; border: 1px solid #ccc; border-radius: 4px; background: #fff; }
+    .cc-compose-emojiitem { font-size: 16px; line-height: 1; padding: 4px; border: none;
+                            background: transparent; cursor: pointer; border-radius: 4px; }
+    .cc-compose-emojiitem:hover { background: #f0f0f0; }
     .cc-compose-hint { margin-top: 6px; font: 11px/1.4 -apple-system, sans-serif;
                        color: #6d6d6d; }
     .cc-compose-hint.cc-compose-error { color: #c0392b; font-weight: 600; }
@@ -295,6 +300,8 @@ if (window.__chitChatLoaded) {
     :host(.cc-dark) button, :host(.cc-dark) .cc-compose-toolbtn { background: #3a3a3a; border-color: #555; color: #eee; }
     :host(.cc-dark) .cc-compose-toolbtn:hover { background: #4a4a4a; }
     :host(.cc-dark) .cc-compose-linkform input { background: #1e1e1e; border-color: #555; color: #eee; }
+    :host(.cc-dark) .cc-compose-emojipopover { background: #1e1e1e; border-color: #555; }
+    :host(.cc-dark) .cc-compose-emojiitem:hover { background: #3a3a3a; }
     :host(.cc-dark) .cc-compose-save { background: #0265DC; border-color: #0265DC; color: #fff; }
     :host(.cc-dark) .cc-compose-cancel { background: #3a3a3a; color: #eee; }
   `;
@@ -830,6 +837,10 @@ if (window.__chitChatLoaded) {
   // screenshots as base64 can bloat a body into the MBs with no server-side guard.
   const MAX_COMPOSE_BODY_CHARS = 2_000_000; // ~2MB
 
+  // Native Unicode emoji, inserted as plain text. Duplicated in
+  // QuillEditor.jsx, which this dependency-free bundle can't import.
+  const EMOJIS = ['👍', '👎', '😀', '😂', '🎉', '🔥', '👀', '✅', '❌', '⚠️', '🐛', '💡', '❓', '❤️', '🙏', '👏', '🚀', '💯', '😅', '🤔', '🙌', '✨', '📌', '⏳'];
+
   let _composeSaveBtn = null; // shadow-root button ref; can't querySelector across the boundary
 
   function openCompose(el, selection, cx, cy) {
@@ -1020,6 +1031,31 @@ if (window.__chitChatLoaded) {
       fileInput.click();
     });
 
+    const emojiPopover = document.createElement('div');
+    emojiPopover.className = 'cc-compose-emojipopover';
+    emojiPopover.style.display = 'none';
+    EMOJIS.forEach((emoji) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'cc-compose-emojiitem';
+      item.textContent = emoji;
+      item.setAttribute('aria-label', emoji);
+      item.addEventListener('mousedown', (e) => e.preventDefault());
+      item.addEventListener('click', () => {
+        editable.focus();
+        restoreRange();
+        document.execCommand('insertText', false, emoji);
+        emojiPopover.style.display = 'none';
+        autoGrow();
+      });
+      emojiPopover.appendChild(item);
+    });
+
+    const emojiBtn = mkToolBtn('🙂', 'Insert emoji', () => {
+      saveRange();
+      emojiPopover.style.display = emojiPopover.style.display === 'none' ? 'grid' : 'none';
+    });
+
     // The core QA flow: paste a screenshot straight into the comment.
     editable.addEventListener('paste', (e) => {
       const items = e.clipboardData?.items;
@@ -1036,8 +1072,8 @@ if (window.__chitChatLoaded) {
       // still gates it at render time.
     });
 
-    toolbar.append(boldBtn, italicBtn, linkBtn, imageBtn);
-    root.append(toolbar, editable, linkForm, fileInput);
+    toolbar.append(boldBtn, italicBtn, linkBtn, imageBtn, emojiBtn);
+    root.append(toolbar, editable, linkForm, emojiPopover, fileInput);
 
     const hint = document.createElement('p');
     hint.className = 'cc-compose-hint';
