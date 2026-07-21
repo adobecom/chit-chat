@@ -16,7 +16,7 @@
  *   theme      — 'light'|'dark'
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import '@react-spectrum/s2/page.css';
 import '../sidepanel.css';
@@ -35,11 +35,12 @@ import {
   Divider,
   DialogTrigger,
   AlertDialog,
-  TextArea,
   TagGroup,
   Tag,
   Avatar,
 } from '@react-spectrum/s2';
+import { sanitizeHtml, stripHtml } from './sanitize.js';
+import QuillEditor from './QuillEditor.jsx';
 import BrightnessContrastIcon from '@react-spectrum/s2/icons/BrightnessContrast';
 import ChevronLeftIcon from '@react-spectrum/s2/icons/ChevronLeft';
 import CircleIcon from '@react-spectrum/s2/icons/Circle';
@@ -52,6 +53,11 @@ import SelectRectangleIcon from '@react-spectrum/s2/icons/SelectRectangle';
 import TargetIcon from '@react-spectrum/s2/icons/Target';
 import ThumbDownIcon from '@react-spectrum/s2/icons/ThumbDown';
 import ThumbUpIcon from '@react-spectrum/s2/icons/ThumbUp';
+
+// Caps a comment body defensively — base64 screenshots can bloat it into the
+// MBs, and neither the API proxy nor the backend's body-column limit is guarded.
+const MAX_COMMENT_BODY_CHARS = 2_000_000; // ~2MB
+const BODY_TOO_LARGE_MSG = "That comment is too large to post — try a smaller or cropped screenshot.";
 
 // ── Send to service worker ────────────────────────────────────────────────────
 
@@ -121,37 +127,47 @@ async function setMyVote(commentId, v) {
   return storage.set(`vote:${commentId}`, v);
 }
 
-// Extract plain text from a (possibly HTML) comment body — milo stores Quill
-// rich text, so bodies can contain markup. Parse with DOMParser rather than
-// assigning innerHTML on a live-document element: a DOMParser document has no
-// browsing context, so embedded resources (e.g. `<img src>`) never load and no
-// beacon fires while we're only reading textContent.
-function stripHtml(html) {
-  if (!html) return '';
-  return new DOMParser().parseFromString(html, 'text/html').body.textContent ?? '';
-}
-
-// Highlights "@Name" substrings matched against comment.mentions (not raw
-// "@" text). Returns React children, so this stays auto-escaped.
-function renderMentionHighlights(text, mentions) {
+// Wraps "@Name" occurrences (matched against comment.mentions, not raw "@"
+// text) in a highlight span, operating on already-*sanitized* HTML rather than
+// plain text — comment bodies are Quill-authored HTML now, so a naive
+// string/regex pass over the markup could match inside attribute values.
+// Walking text nodes via DOMParser (no browsing context, so no embedded
+// resource ever loads/fires here) keeps the rewrite scoped to visible text.
+function highlightMentionsHtml(html, mentions) {
   const names = [...new Set((mentions ?? []).map((m) => m.name).filter(Boolean))]
     // Longest names first, so "@Alice Reza" isn't cut short by "@Alice" from another mention.
     .sort((a, b) => b.length - a.length)
     .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  if (!names.length) return text;
+  if (!names.length || !html) return html;
 
   const re = new RegExp(`@(?:${names.join('|')})`, 'g');
-  const parts = [];
-  let lastIndex = 0;
-  let match = re.exec(text);
-  while (match) {
-    if (match.index > lastIndex) parts.push(text.slice(lastIndex, match.index));
-    parts.push(<span className="cc-mention" key={match.index}>{match[0]}</span>);
-    lastIndex = match.index + match[0].length;
-    match = re.exec(text);
-  }
-  parts.push(text.slice(lastIndex));
-  return parts;
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+  let node = walker.nextNode();
+  while (node) { textNodes.push(node); node = walker.nextNode(); }
+
+  textNodes.forEach((textNode) => {
+    const text = textNode.textContent;
+    re.lastIndex = 0;
+    if (!re.test(text)) return;
+    re.lastIndex = 0;
+    const frag = doc.createDocumentFragment();
+    let lastIndex = 0;
+    let match = re.exec(text);
+    while (match) {
+      if (match.index > lastIndex) frag.appendChild(doc.createTextNode(text.slice(lastIndex, match.index)));
+      const span = doc.createElement('span');
+      span.className = 'cc-mention';
+      span.textContent = match[0];
+      frag.appendChild(span);
+      lastIndex = match.index + match[0].length;
+      match = re.exec(text);
+    }
+    if (lastIndex < text.length) frag.appendChild(doc.createTextNode(text.slice(lastIndex)));
+    textNode.replaceWith(frag);
+  });
+  return doc.body.innerHTML;
 }
 
 // Human-readable status label. Undefined/null is treated as 'open'.
@@ -762,10 +778,11 @@ function ThreadCard({ thread, resolution, onClick }) {
 }
 
 // ── @-mention autocomplete ───────────────────────────────────────────────────
-// "@" opens a floating suggestion list (cc:api:searchPeople). Not caret-
-// anchored — S2's TextArea has no rich-text token support, so a mention is
-// just inserted text + an email tracked alongside it, not an atomic token.
-// Shared by the reply composer (ThreadDetail) and edit editor (CommentItem).
+// "@" opens a floating suggestion list (cc:api:searchPeople). Not an atomic
+// token — a mention is just inserted "@Name " text in the Quill editor (see
+// QuillEditor.jsx) plus an email tracked alongside it in React state, not a
+// rich-text object Quill itself understands. Shared by the reply composer
+// (ThreadDetail) and edit editor (CommentItem).
 
 const MENTION_SEARCH_DEBOUNCE_MS = 150;
 
@@ -782,17 +799,22 @@ function findMentionQuery(text, caret) {
   return { query: match[1], start };
 }
 
-function useMentionPicker(text, setText, mentions, setMentions) {
-  const textareaRef = useRef(null);
+// `editorRef` points at a QuillEditor instance (see QuillEditor.jsx) rather
+// than a controlled string + <textarea> ref: compose/edit boxes are now
+// uncontrolled Quill instances, so the picker tracks the caret via
+// QuillEditor's onCaretChange callback and edits the mention text in place
+// through QuillEditor's getSelection()/replaceRange() instead of doing string
+// surgery on React state.
+function useMentionPicker(editorRef, mentions, setMentions) {
   const [active, setActive] = useState(null); // { query, start } | null
   const [results, setResults] = useState([]);
   const [activeIndex, setActiveIndex] = useState(0);
 
-  // Re-derives the active @-query from the caret; onChange only gives the new
-  // string, not a DOM event, so callers pass this after change/click/key-up.
-  function syncFromCaret(nextText = text) {
-    const el = textareaRef.current?.getInputElement?.();
-    const found = el ? findMentionQuery(nextText, el.selectionStart) : null;
+  // Re-derives the active @-query from the caret. Wired up as QuillEditor's
+  // onCaretChange prop, which calls this with the editor's current plain text
+  // and caret index (null when the editor has no active selection).
+  function syncFromCaret(nextText, caret) {
+    const found = findMentionQuery(nextText ?? '', caret);
     setActive(found);
     if (!found) setResults([]);
   }
@@ -816,25 +838,19 @@ function useMentionPicker(text, setText, mentions, setMentions) {
 
   function pick(person) {
     if (!active) return;
-    const el = textareaRef.current?.getInputElement?.();
-    const caret = el ? el.selectionStart : active.start + active.query.length + 1;
-    const before = text.slice(0, active.start);
-    const after = text.slice(caret);
+    const editor = editorRef.current;
+    if (!editor) return;
+    // mousedown (see MentionSuggestions) fires before blur, so the editor's
+    // selection is still live here.
+    const sel = editor.getSelection();
+    const caret = sel ? sel.index : active.start + active.query.length + 1;
     const insertion = `@${person.name} `;
-    setText(`${before}${insertion}${after}`);
+    editor.replaceRange(active.start, caret, insertion);
     setMentions((prev) => (
       prev.some((m) => m.email === person.email) ? prev : [...prev, { email: person.email, name: person.name }]
     ));
     setActive(null);
     setResults([]);
-    // Restore focus/caret after the inserted mention, once React commits.
-    requestAnimationFrame(() => {
-      const node = textareaRef.current?.getInputElement?.();
-      if (!node) return;
-      const pos = before.length + insertion.length;
-      node.focus();
-      node.setSelectionRange(pos, pos);
-    });
   }
 
   // Returns true if the key was consumed by list navigation (caller should preventDefault).
@@ -860,7 +876,7 @@ function useMentionPicker(text, setText, mentions, setMentions) {
   }
 
   return {
-    textareaRef, results, activeIndex, setActiveIndex, syncFromCaret, handleKeyDown, pick, removeMention, reset,
+    results, activeIndex, setActiveIndex, syncFromCaret, handleKeyDown, pick, removeMention, reset,
   };
 }
 
@@ -994,11 +1010,17 @@ function AssigneePicker({ thread, onUpdate, onError }) {
 // ── Thread detail ─────────────────────────────────────────────────────────────
 
 function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpdate, onDelete, onScrollTo, onError }) {
-  const [replyText, setReplyText] = useState('');
+  // Uncontrolled Quill instance (see QuillEditor) — track only whether it's
+  // empty, to drive the Reply button's disabled state.
+  const replyEditorRef = useRef(null);
+  const [replyEmpty, setReplyEmpty] = useState(true);
   const [replyMentions, setReplyMentions] = useState([]);
   const [posting, setPosting] = useState(false);
+  // Field-level validation error (size guard), shown inline under the editor —
+  // distinct from onError's global banner, which is reserved for API/network failures.
+  const [replyError, setReplyError] = useState(null);
   const commentsRef = useRef(null);
-  const mentionPicker = useMentionPicker(replyText, setReplyText, replyMentions, setReplyMentions);
+  const mentionPicker = useMentionPicker(replyEditorRef, replyMentions, setReplyMentions);
 
   if (!thread) {
     // activeId is only ever set once the thread exists, so a missing thread
@@ -1049,15 +1071,21 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   }
 
   async function postReply() {
-    if (!replyText.trim()) return;
+    const editor = replyEditorRef.current;
+    if (!editor || !editor.getText().trim()) return;
+    setReplyError(null);
+    // Store raw HTML; CommentBody sanitizes at render time (same as milo).
+    const body = editor.getHtml();
+    if (body.length > MAX_COMMENT_BODY_CHARS) { setReplyError(BODY_TOO_LARGE_MSG); return; }
     setPosting(true);
     try {
       const authorName = myAuthorName(auth.profile);
       const comment = await sw('cc:api:createComment', {
-        threadId: thread.id, body: replyText.trim(), authorName, mentions: replyMentions.map((m) => m.email),
+        threadId: thread.id, body, authorName, mentions: replyMentions.map((m) => m.email),
       });
       onUpdate({ ...thread, comments: [...(thread.comments ?? []), comment] });
-      setReplyText('');
+      editor.clear();
+      setReplyEmpty(true);
       setReplyMentions([]);
       mentionPicker.reset();
       // Bring the just-posted comment into view (comments render oldest→newest).
@@ -1067,7 +1095,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         if (el) el.scrollTop = el.scrollHeight;
       }));
     } catch (err) {
-      // Leave replyText/replyMentions intact so the user doesn't lose what they wrote.
+      // Leave the editor's contents and picked mentions intact so the user doesn't lose what they wrote.
       onError?.(`Couldn't post reply — ${err.message}`);
     } finally { setPosting(false); }
   }
@@ -1157,16 +1185,13 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
             if (mentionPicker.handleKeyDown(e)) { e.preventDefault(); return; }
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) postReply();
           }}
-          onKeyUp={() => mentionPicker.syncFromCaret()}
-          onClick={() => mentionPicker.syncFromCaret()}
         >
-          <TextArea
-            ref={mentionPicker.textareaRef}
-            value={replyText}
-            onChange={(v) => { setReplyText(v); mentionPicker.syncFromCaret(v); }}
+          <QuillEditor
+            ref={replyEditorRef}
             placeholder="Reply… (@ to mention someone)"
             aria-label="Reply text"
-            width="100%"
+            onEmptyChange={setReplyEmpty}
+            onCaretChange={mentionPicker.syncFromCaret}
           />
           <MentionSuggestions
             results={mentionPicker.results}
@@ -1175,13 +1200,15 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
             onHover={mentionPicker.setActiveIndex}
           />
         </div>
-        <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to send</div>
+        <div className={`cc-reply-hint${replyError ? ' cc-reply-error' : ''}`}>
+          {replyError ?? 'Enter for a new line · ⌘/Ctrl+Enter to send'}
+        </div>
         <div className="cc-reply-actions">
           <Button
             variant="accent"
             size="S"
             onPress={postReply}
-            isDisabled={posting || !replyText.trim()}
+            isDisabled={posting || replyEmpty}
           >
             {posting ? 'Posting…' : 'Reply'}
           </Button>
@@ -1191,37 +1218,59 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   );
 }
 
+// Sanitized render of a comment body (milo-authored HTML may include links
+// and images), with "@Name" mentions highlighted afterward. Memoized since
+// screenshot bodies can be large base64 strings.
+function CommentBody({ body, mentions }) {
+  const safe = useMemo(
+    () => highlightMentionsHtml(sanitizeHtml(body ?? ''), mentions),
+    [body, mentions],
+  );
+  // A <div>, not <p> — sanitized output can itself contain block-level <p>.
+  return <div className="cc-comment-body" dangerouslySetInnerHTML={{ __html: safe }} />;
+}
+
 // ── Comment item ──────────────────────────────────────────────────────────────
 
 function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }) {
   const [editing, setEditing] = useState(false);
-  // editText is seeded when the editor opens (see openEditor), not just at mount,
-  // so it reflects the freshest server body if a poll updated it in the meantime.
-  const [editText, setEditText] = useState(comment.body ?? '');
+  const [editEmpty, setEditEmpty] = useState(false);
+  // Field-level validation error (size guard), shown inline under the editor —
+  // distinct from onError's global banner, which is reserved for API/network failures.
+  const [editError, setEditError] = useState(null);
+  // Uncontrolled Quill instance, remounted fresh each time `editing` flips
+  // true, seeded from comment.body — so it reflects the latest server body.
+  const editorRef = useRef(null);
+  // editMentions is (re-)seeded when the editor opens (see toggleEditor), not
+  // just at mount, so it reflects the freshest server mentions if a poll
+  // updated the comment in the meantime.
   const [editMentions, setEditMentions] = useState(comment.mentions ?? []);
-  const mentionPicker = useMentionPicker(editText, setEditText, editMentions, setEditMentions);
+  const mentionPicker = useMentionPicker(editorRef, editMentions, setEditMentions);
   // Tri-state: 1 = upvoted, -1 = downvoted, 0 = not voted
   const [myVote, setMyVoteState] = useState(0);
 
   useEffect(() => { getMyVote(comment.id).then(setMyVoteState); }, [comment.id]);
 
-  // Open/close the inline editor. On open, re-seed from the current comment.body
-  // (and mentions) so an edit that started after a background poll doesn't
-  // begin from stale text. While the editor is open, editText persists across
-  // re-renders, so an incoming poll never clobbers what the user is typing —
-  // the React analogue of milo's guard, which simply skips re-rendering the
-  // detail view during editing.
+  // Open/close the inline editor. On open, re-seed editMentions from the
+  // current comment.mentions (the Quill instance itself is remounted fresh
+  // from comment.body, see editorRef above) so an edit that started after a
+  // background poll doesn't begin from stale data. While the editor is open,
+  // an incoming poll never clobbers what's being typed — the React analogue
+  // of milo's guard, which simply skips re-rendering the detail view during
+  // editing.
   function toggleEditor() {
     mentionPicker.reset();
-    if (editing) { setEditing(false); return; }
-    setEditText(comment.body ?? '');
-    setEditMentions(comment.mentions ?? []);
-    setEditing(true);
+    setEditError(null); // don't carry a stale error into the next open
+    if (!editing) setEditMentions(comment.mentions ?? []);
+    setEditing((prev) => !prev);
   }
 
   async function saveEdit() {
-    const body = editText.trim();
-    if (!body) return;
+    const editor = editorRef.current;
+    if (!editor || !editor.getText().trim()) return;
+    setEditError(null);
+    const body = editor.getHtml();
+    if (body.length > MAX_COMMENT_BODY_CHARS) { setEditError(BODY_TOO_LARGE_MSG); return; }
     try {
       const updated = await sw('cc:api:patchComment', { id: comment.id, body, mentions: editMentions.map((m) => m.email) });
       onUpdate({
@@ -1304,15 +1353,13 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
               if (mentionPicker.handleKeyDown(e)) { e.preventDefault(); return; }
               if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit();
             }}
-            onKeyUp={() => mentionPicker.syncFromCaret()}
-            onClick={() => mentionPicker.syncFromCaret()}
           >
-            <TextArea
-              ref={mentionPicker.textareaRef}
-              value={editText}
-              onChange={(v) => { setEditText(v); mentionPicker.syncFromCaret(v); }}
+            <QuillEditor
+              ref={editorRef}
+              initialHtml={comment.body ?? ''}
               aria-label="Edit comment text"
-              width="100%"
+              onEmptyChange={setEditEmpty}
+              onCaretChange={mentionPicker.syncFromCaret}
               autoFocus
             />
             <MentionSuggestions
@@ -1322,16 +1369,17 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
               onHover={mentionPicker.setActiveIndex}
             />
           </div>
-          <div className="cc-reply-hint">Enter for a new line · ⌘/Ctrl+Enter to save</div>
+          <div className={`cc-reply-hint${editError ? ' cc-reply-error' : ''}`}>
+            {editError ?? 'Enter for a new line · ⌘/Ctrl+Enter to save'}
+          </div>
           <div className="cc-edit-actions">
-            <Button variant="secondary" size="S" onPress={() => { setEditing(false); mentionPicker.reset(); }}>Cancel</Button>
-            <Button variant="accent" size="S" onPress={saveEdit} isDisabled={!editText.trim()}>Save</Button>
+            <Button variant="secondary" size="S" onPress={toggleEditor}>Cancel</Button>
+            <Button variant="accent" size="S" onPress={saveEdit} isDisabled={editEmpty}>Save</Button>
           </div>
         </>
       ) : (
         <>
-          {/* Strip any HTML from milo-authored bodies; plain-text input stays as-is */}
-          <p className="cc-comment-body">{renderMentionHighlights(stripHtml(comment.body ?? ''), comment.mentions)}</p>
+          <CommentBody body={comment.body} mentions={comment.mentions} />
           {comment.mentions?.length > 0 && (
             <TagGroup
               aria-label="Mentioned people"

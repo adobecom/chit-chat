@@ -267,8 +267,147 @@ html, body {
   word-break: break-word;
 }
 
+/* pre-wrap above still applies to Quill-authored <p>/<br> bodies — Quill's
+   HTML has no stray text-node newlines between tags, so no extra spacing. */
+.cc-comment-body p {
+  margin: 0 0 8px;
+}
+
+.cc-comment-body p:last-child {
+  margin-bottom: 0;
+}
+
+.cc-comment-body a {
+  color: light-dark(#0265dc, #5aa2ff);
+  text-decoration: underline;
+}
+
+.cc-comment-body img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  max-height: 320px;
+  margin: 6px 0;
+  border-radius: 4px;
+}
+
+/* Quill's own mount + snow theme, replacing the plain TextArea. Capped at
+   max-height/overflow-y so a long reply/edit can't grow unbounded and push
+   the action row off-screen — matches content.js's compose popup. */
+.cc-quill-mount .ql-editor {
+  font-size: 14px;
+  min-height: 60px;
+  max-height: 45vh;
+  overflow-y: auto;
+}
+
+/* quill.snow.css hardcodes light-mode-only colors for chrome it draws
+   itself — the toolbar/container border, icon stroke/fill, placeholder
+   text, and the native link-edit tooltip. It sets no background-color on
+   the toolbar/editor/container themselves, so those already inherit the
+   panel's dark background correctly; only these specific values need a
+   light-dark() override, same pattern as the rest of this file. */
+.cc-quill-mount .ql-toolbar.ql-snow,
+.cc-quill-mount .ql-container.ql-snow {
+  border-color: light-dark(#ccc, #555);
+}
+
+.cc-quill-mount .ql-snow .ql-stroke,
+.cc-quill-mount .ql-snow .ql-stroke-miter {
+  stroke: light-dark(#444, #ccc);
+}
+
+.cc-quill-mount .ql-snow .ql-fill,
+.cc-quill-mount .ql-snow .ql-stroke.ql-fill {
+  fill: light-dark(#444, #ccc);
+}
+
+.cc-quill-mount .ql-editor.ql-blank::before {
+  color: light-dark(rgba(0, 0, 0, 0.6), rgba(255, 255, 255, 0.5));
+}
+
+.cc-quill-mount .ql-snow .ql-tooltip {
+  background-color: light-dark(#fff, #2a2a2a);
+  border-color: light-dark(#ccc, #555);
+  color: light-dark(#444, #eee);
+}
+
+.cc-quill-mount .ql-snow .ql-tooltip input[type='text'] {
+  background: light-dark(#fff, #1e1e1e);
+  border-color: light-dark(#ccc, #555);
+  color: light-dark(#1b1b1b, #eee);
+}
+
+.cc-quill-mount .ql-snow .ql-tooltip a {
+  color: light-dark(#06c, #5aa2ff);
+}
+
+.cc-quill-fallback {
+  width: 100%;
+  box-sizing: border-box;
+  max-height: 40vh;
+}
+
+/* Emoji picker appended to Quill's toolbar (see QuillEditor.jsx). */
+.cc-emoji-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.cc-emoji-btn {
+  height: 24px;
+  width: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.cc-emoji-btn:hover {
+  background: light-dark(rgba(0, 0, 0, 0.06), rgba(255, 255, 255, 0.1));
+}
+
+.cc-emoji-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.cc-emoji-popover {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 10;
+  margin-top: 4px;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 2px;
+  padding: 6px;
+  background: light-dark(#fff, #2a2a2a);
+  border: 1px solid light-dark(#ccc, #555);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.cc-emoji-item {
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.cc-emoji-item:hover {
+  background: light-dark(rgba(0, 0, 0, 0.08), rgba(255, 255, 255, 0.12));
+}
+
 .cc-edit-actions {
   display: flex;
+  justify-content: flex-end;
   gap: 6px;
   margin-top: 6px;
 }
@@ -319,15 +458,12 @@ html, body {
   margin-top: 6px;
 }
 
-/*
- * S2 TextArea auto-grows by writing an inline height = scrollHeight. In this
- * fixed-height panel an unbounded reply/edit box would crush the content above
- * it, so cap growth with max-height (which wins over the inline height) and let
- * the native textarea scrollbar take over for very long, multi-paragraph input.
- */
-.cc-reply-area textarea,
-.cc-comment-block textarea {
-  max-height: 40vh;
+/* Size-limit validation error, shown inline in place of the hint text —
+   matches content.js's compose popup (same color as its light-mode error). */
+.cc-reply-hint.cc-reply-error {
+  color: light-dark(#c0392b, #ff6b6b);
+  opacity: 1;
+  font-weight: 600;
 }
 
 .cc-reply-actions {

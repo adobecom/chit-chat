@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "@react-spectrum/s2": "^1.4.0",
+    "dompurify": "^3.4.12",
+    "quill": "^2.0.3",
     "react": "^19",
     "react-dom": "^19"
   },
