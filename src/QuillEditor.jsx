@@ -1,26 +1,18 @@
 /**
  * QuillEditor.jsx — rich-text compose box for replies and comment edits.
  *
- * Mirrors the milo annotations client's QuillEditor.js, but bundled (npm
- * `quill` import) rather than lazy-loaded from a CDN: the extension's side
- * panel runs under MV3's default `script-src 'self'` CSP, which a CDN
- * <script>/<link> can't satisfy. Quill + its snow theme CSS ship inside
- * dist/sidepanel.js / dist/sidepanel.css instead.
- *
- * Uncontrolled by design — Quill owns its own DOM, so the parent doesn't hold
- * the HTML in React state on every keystroke. `onEmptyChange` lets the parent
- * drive a submit button's disabled state without re-rendering per keystroke.
+ * Bundles Quill (rather than the milo client's lazy CDN load) since the side
+ * panel's MV3 CSP is script-src 'self'. Uncontrolled by design — `getHtml`/
+ * `onEmptyChange` read Quill's own DOM instead of mirroring it into state.
  */
 import { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import Quill from 'quill';
 import 'quill/dist/quill.snow.css';
 import { escAttr, stripHtml } from './sanitize.js';
 
-// Downscale a pasted/inserted screenshot before it's embedded as base64 — a
-// full-resolution screenshot can be several MB, which bloats the stored
-// comment body and risks the API proxy's request timeout (MWPW-201267).
-// Mirrors content.js's downscaleImage; duplicated rather than shared because
-// content.js is a dependency-free IIFE bundle and can't import this module.
+// Downscale pasted/inserted screenshots before embedding as base64 — full
+// resolution can be several MB. Duplicated in content.js, which can't
+// import this module (dependency-free IIFE bundle).
 const MAX_IMAGE_DIM = 1600;
 
 function readAsDataUrl(file) {

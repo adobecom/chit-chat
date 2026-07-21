@@ -51,11 +51,8 @@ import TargetIcon from '@react-spectrum/s2/icons/Target';
 import ThumbDownIcon from '@react-spectrum/s2/icons/ThumbDown';
 import ThumbUpIcon from '@react-spectrum/s2/icons/ThumbUp';
 
-// A pasted screenshot is embedded as base64, which can bloat a comment body
-// into the MBs. background.js's API proxy has no size guard of its own and
-// the backend's storage limit for the `body` column is unconfirmed, so cap
-// defensively here rather than let a huge POST silently time out or fail
-// server-side (MWPW-201267).
+// Caps a comment body defensively — base64 screenshots can bloat it into the
+// MBs, and neither the API proxy nor the backend's body-column limit is guarded.
 const MAX_COMMENT_BODY_CHARS = 2_000_000; // ~2MB
 const BODY_TOO_LARGE_MSG = "That comment is too large to post — try a smaller or cropped screenshot.";
 
@@ -737,9 +734,8 @@ function ThreadCard({ thread, resolution, onClick }) {
 // ── Thread detail ─────────────────────────────────────────────────────────────
 
 function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpdate, onDelete, onScrollTo, onError }) {
-  // The reply editor is an uncontrolled Quill instance (see QuillEditor) — we
-  // don't hold its HTML in state on every keystroke, just whether it's empty
-  // (to drive the Reply button's disabled state).
+  // Uncontrolled Quill instance (see QuillEditor) — track only whether it's
+  // empty, to drive the Reply button's disabled state.
   const replyEditorRef = useRef(null);
   const [replyEmpty, setReplyEmpty] = useState(true);
   const [posting, setPosting] = useState(false);
@@ -796,9 +792,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   async function postReply() {
     const editor = replyEditorRef.current;
     if (!editor || !editor.getText().trim()) return;
-    // Store the raw (unsanitized) Quill HTML — same as milo — and sanitize
-    // only at render time (CommentItem), so a future allow-list widening
-    // doesn't require re-saving old comments.
+    // Store raw HTML; CommentBody sanitizes at render time (same as milo).
     const body = editor.getHtml();
     if (body.length > MAX_COMMENT_BODY_CHARS) { onError?.(BODY_TOO_LARGE_MSG); return; }
     setPosting(true);
@@ -921,16 +915,11 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   );
 }
 
-// Sanitized render of a (possibly HTML) comment body — milo stores Quill rich
-// text, so bodies may contain markup, including links and inline images
-// (MWPW-201267). sanitizeHtml allow-lists tags/attrs and re-gates img/a URLs
-// through safeMediaUrl (see sanitize.js), so this is safe to render as HTML.
-// Memoized because pasted-screenshot bodies can be large base64 strings and
-// comment.body only changes on edit, not every parent re-render.
+// Sanitized render of a comment body (milo-authored HTML may include links
+// and images). Memoized since screenshot bodies can be large base64 strings.
 function CommentBody({ body }) {
   const safe = useMemo(() => sanitizeHtml(body ?? ''), [body]);
-  // A <div>, not <p> — sanitized output can itself contain block-level <p>,
-  // which is invalid nested inside a <p>.
+  // A <div>, not <p> — sanitized output can itself contain block-level <p>.
   return <div className="cc-comment-body" dangerouslySetInnerHTML={{ __html: safe }} />;
 }
 
@@ -939,20 +928,16 @@ function CommentBody({ body }) {
 function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }) {
   const [editing, setEditing] = useState(false);
   const [editEmpty, setEditEmpty] = useState(false);
-  // The edit editor is an uncontrolled Quill instance mounted fresh each time
-  // `editing` flips true (see the conditional render below), seeded from
-  // comment.body via QuillEditor's initialHtml — so it always reflects the
-  // freshest server body if a poll updated it in the meantime, without needing
-  // React state to hold the HTML on every keystroke.
+  // Uncontrolled Quill instance, remounted fresh each time `editing` flips
+  // true, seeded from comment.body — so it reflects the latest server body.
   const editorRef = useRef(null);
   // Tri-state: 1 = upvoted, -1 = downvoted, 0 = not voted
   const [myVote, setMyVoteState] = useState(0);
 
   useEffect(() => { getMyVote(comment.id).then(setMyVoteState); }, [comment.id]);
 
-  // Open/close the inline editor. While it's open, an incoming poll never
-  // clobbers what the user is typing — the React analogue of milo's guard,
-  // which simply skips re-rendering the detail view during editing.
+  // While the editor is open, an incoming poll never clobbers what's being
+  // typed — the React analogue of milo's guard against mid-edit re-renders.
   function toggleEditor() {
     setEditing((prev) => !prev);
   }

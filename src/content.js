@@ -261,10 +261,9 @@ if (window.__chitChatLoaded) {
   // selectors from matching at all. `:host(.cc-dark)` mirrors the panel's
   // light/dark toggle (synced via chrome.storage.sync, see _theme).
   const COMPOSE_SHADOW_CSS = `
-    /* Rich compose editable (MWPW-201267) — replaces the plain <textarea>
-       that used to live here; a contenteditable div lets QA author inline
-       bold/italic/links/pasted screenshots without pulling a full editor
-       (Quill) into every host page's injected script. */
+    /* contenteditable, not Quill — keeps this injected-into-every-page bundle
+       dependency-free while still letting QA author bold/italic/links/pasted
+       screenshots inline. */
     .cc-compose-editable { display: block; width: 100%; min-height: 120px; max-height: 45vh;
                box-sizing: border-box; overflow-y: auto;
                border: 1px solid #ccc; border-radius: 4px; padding: 8px;
@@ -827,11 +826,8 @@ if (window.__chitChatLoaded) {
 
   // ── Compose popover ────────────────────────────────────────────────────────
 
-  // A pasted screenshot is embedded as base64, which can bloat a comment body
-  // into the MBs. background.js's API proxy has no size guard of its own and
-  // the backend's storage limit for the `body` column is unconfirmed, so cap
-  // defensively here (mirrors the same threshold in sidepanel.jsx) rather than
-  // let a huge POST silently time out or fail server-side (MWPW-201267).
+  // Same defensive cap as sidepanel.jsx's MAX_COMMENT_BODY_CHARS — pasted
+  // screenshots as base64 can bloat a body into the MBs with no server-side guard.
   const MAX_COMPOSE_BODY_CHARS = 2_000_000; // ~2MB
 
   let _composeSaveBtn = null; // shadow-root button ref; can't querySelector across the boundary
@@ -869,11 +865,8 @@ if (window.__chitChatLoaded) {
     style.textContent = COMPOSE_SHADOW_CSS;
     root.appendChild(style);
 
-    // Rich compose (MWPW-201267): a small toolbar + contenteditable div in
-    // place of the plain <textarea>, so QA can author bold/italic, a link,
-    // and paste screenshots inline. We store raw contenteditable HTML —
-    // sanitizeHtml (sidepanel.jsx) is the security gate at render time, so
-    // there's no need to sanitize here, only to keep authoring usable.
+    // We store raw contenteditable HTML — sanitizeHtml (sidepanel.jsx) is the
+    // security gate at render time, so nothing needs sanitizing here.
     const toolbar = document.createElement('div');
     toolbar.className = 'cc-compose-toolbar';
 
@@ -976,9 +969,8 @@ if (window.__chitChatLoaded) {
       if (e.key === 'Escape') { e.stopPropagation(); linkForm.style.display = 'none'; editable.focus(); }
     });
 
-    // Downscale oversized pastes/inserts before embedding as base64 — a
-    // full-resolution screenshot can be several MB, which both bloats the
-    // stored comment body and risks the API proxy's request timeout.
+    // Downscale before embedding as base64 — a full-resolution screenshot
+    // can be several MB.
     function downscaleImage(dataUrl, maxDim) {
       return new Promise((resolve) => {
         const img = new Image();
@@ -1040,9 +1032,8 @@ if (window.__chitChatLoaded) {
           return;
         }
       }
-      // Non-image paste (plain/rich text from elsewhere) falls through to the
-      // browser's default paste; sanitizeHtml still gates whatever lands here
-      // at render time, so an unexpected tag from another page is harmless.
+      // Non-image paste falls through to the browser's default — sanitizeHtml
+      // still gates it at render time.
     });
 
     toolbar.append(boldBtn, italicBtn, linkBtn, imageBtn);
@@ -1083,11 +1074,9 @@ if (window.__chitChatLoaded) {
     root.appendChild(actions);
     document.body.appendChild(pop);
     editable.focus();
-    // Without this, Chrome wraps each Enter-separated line in a bare <div>
-    // (the browser's default), which sanitizeHtml's allow-list doesn't
-    // include — DOMPurify unwraps disallowed-but-safe tags and keeps their
-    // text with no separator, so multi-line comments would render as one
-    // run-on line. <p> is allow-listed, so make it the separator instead.
+    // Without this, Chrome's default <div>-per-line on Enter gets unwrapped
+    // (not allow-listed) with no separator, collapsing multi-line comments
+    // into a run-on line — <p> is allow-listed, so use that instead.
     document.execCommand('defaultParagraphSeparator', false, 'p');
 
     _composeSaveBtn = save;

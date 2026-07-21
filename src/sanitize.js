@@ -1,29 +1,21 @@
 /**
  * sanitize.js — HTML allow-list for milo-authored comment bodies.
  *
- * milo stores comments as Quill-authored HTML (see the milo annotations client's
- * own sanitize.js, which this module mirrors). Widened here (MWPW-201267) beyond
- * strong/em/p/br to also allow inline links and images — the same text-render
- * path emoji goes through (MWPW-200384) — so QA-pasted screenshots and links
- * show up instead of being flattened to plain text.
+ * Mirrors the milo annotations client's sanitize.js, widened beyond
+ * strong/em/p/br to also allow links and inline images.
  */
 import DOMPurify from 'dompurify';
 
 const PC_CONFIG = {
-  // b/i (not just strong/em) because content.js's in-page contenteditable
-  // composer uses document.execCommand('bold'|'italic'), which emits <b>/<i>.
+  // b/i (not just strong/em) because content.js's execCommand('bold'|'italic') emits them.
   ALLOWED_TAGS: ['strong', 'em', 'b', 'i', 'p', 'br', 'a', 'img'],
-  // target/rel aren't here — the afterSanitizeAttributes hook below sets or
-  // strips them unconditionally on every <a>, so whatever DOMPurify's own
-  // attribute pass would've allowed through is irrelevant.
+  // target/rel omitted — the hook below sets/strips them unconditionally on every <a>.
   ALLOWED_ATTR: ['href', 'src', 'alt', 'title'],
 };
 
-// Returns `url` when it is a safe media source to render into an <img>/<video>
-// src (http/https/protocol-relative/relative path, or an inline raster
-// data:image), else ''. Blocks javascript:/blob:/file: and other schemes, and
-// the markup-bearing data: types (data:text/html, data:image/svg+xml) on
-// stored, attacker-authored comment bodies before they reach a reviewer's DOM.
+// Safe media source for <img>/<video> src: http(s), protocol-relative
+// (upgraded to https), relative, or raster data:image. Blocks javascript:/
+// blob:/file: and markup-bearing data: (text/html, svg).
 const DATA_IMAGE_RASTER = /^data:image\/(png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)\s*[;,]/i;
 
 export function safeMediaUrl(url) {
@@ -40,11 +32,9 @@ export function safeMediaUrl(url) {
   }
 }
 
-// Re-gate img[src] and a[href] through safeMediaUrl after DOMPurify's own
-// attribute scrub — the ALLOWED_ATTR list above permits *some* href/src value
-// through, but safeMediaUrl is the scheme allow-list (blocks javascript:/blob:/
-// file:/markup-bearing data:). Also forces target=_blank + rel=noopener
-// noreferrer on links so a comment can't reverse-tabnab the panel.
+// Re-gates img[src]/a[href] through safeMediaUrl after DOMPurify's own
+// attribute scrub, and forces target=_blank + rel=noopener noreferrer on
+// links so a comment can't reverse-tabnab the panel.
 DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   if (node.tagName === 'IMG') {
     const safe = safeMediaUrl(node.getAttribute('src'));
@@ -68,12 +58,8 @@ export function sanitizeHtml(html) {
   return DOMPurify.sanitize(String(html ?? ''), PC_CONFIG);
 }
 
-// Extract plain text from a (possibly HTML) comment body — milo stores Quill
-// rich text, so bodies can contain markup. Parse with DOMParser rather than
-// assigning innerHTML on a live-document element: a DOMParser document has no
-// browsing context, so embedded resources (e.g. `<img src>`) never load and no
-// beacon fires while we're only reading textContent. Used for thread-list
-// previews/search, where only plain text is shown.
+// Plain text via an inert DOMParser (no browsing context, so <img> etc. never
+// load). Used for thread-list previews/search, where only text is shown.
 export function stripHtml(html) {
   if (!html) return '';
   return new DOMParser().parseFromString(html, 'text/html').body.textContent ?? '';
