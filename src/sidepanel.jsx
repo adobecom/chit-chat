@@ -134,7 +134,7 @@ async function setMyVote(commentId, v) {
 // Walking text nodes via DOMParser (no browsing context, so no embedded
 // resource ever loads/fires here) keeps the rewrite scoped to visible text.
 function highlightMentionsHtml(html, mentions) {
-  const names = [...new Set((mentions ?? []).map((m) => m.name).filter(Boolean))]
+  const names = [...new Set((mentions ?? []).map((m) => m.name?.trim()).filter(Boolean))]
     // Longest names first, so "@Alice Reza" isn't cut short by "@Alice" from another mention.
     .sort((a, b) => b.length - a.length)
     .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
@@ -1072,7 +1072,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
 
   async function postReply() {
     const editor = replyEditorRef.current;
-    if (!editor || !editor.getText().trim()) return;
+    if (!editor || replyEmpty) return;
     setReplyError(null);
     // Store raw HTML; CommentBody sanitizes at render time (same as milo).
     const body = editor.getHtml();
@@ -1267,7 +1267,7 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
 
   async function saveEdit() {
     const editor = editorRef.current;
-    if (!editor || !editor.getText().trim()) return;
+    if (!editor || editEmpty) return;
     setEditError(null);
     const body = editor.getHtml();
     if (body.length > MAX_COMMENT_BODY_CHARS) { setEditError(BODY_TOO_LARGE_MSG); return; }

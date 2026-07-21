@@ -59,6 +59,21 @@ function uploadHandler(range, files) {
     });
 }
 
+// Quill's getText() silently drops non-string embeds (e.g. inserted images) —
+// every image insert op is 0 characters in that string, while it's exactly 1
+// unit in the *real* document index space getSelection()/deleteText()/
+// insertText() all operate in (Parchment's default embed length is 1). Any
+// caller pairing getText() with getSelection().index desyncs the moment an
+// image sits before the caret. This mirrors that layout with a single
+// placeholder character per embed so index arithmetic against the returned
+// string lines up with Quill's real indices.
+function getTextWithEmbeds(quill) {
+  return quill.getContents().ops.reduce(
+    (acc, op) => acc + (typeof op.insert === 'string' ? op.insert : '￼'),
+    '',
+  );
+}
+
 // Native Unicode emoji, inserted as plain text — no allow-list/sanitizer
 // changes needed. Duplicated in content.js for the same reason as above.
 const EMOJIS = ['👍', '👎', '😀', '😂', '🎉', '🔥', '👀', '✅', '❌', '⚠️', '🐛', '💡', '❓', '❤️', '🙏', '👏', '🚀', '💯', '😅', '🤔', '🙌', '✨', '📌', '⏳'];
@@ -186,16 +201,20 @@ const QuillEditor = forwardRef(function QuillEditor(
       if (initialHtml) q.clipboard.dangerouslyPasteHTML(initialHtml);
       if (ariaLabel) q.root.setAttribute('aria-label', ariaLabel);
       quillRef.current = q;
-      onEmptyChange?.(q.getText().trim().length === 0);
+      // getLength() counts the doc's mandatory trailing newline, so an empty
+      // editor is always exactly 1 — including an embed (e.g. a lone pasted
+      // image) makes it >= 2. Unlike getText().trim(), this correctly treats
+      // an image-only body as non-empty.
+      onEmptyChange?.(q.getLength() <= 1);
       q.on('text-change', () => {
-        onEmptyChange?.(q.getText().trim().length === 0);
-        onCaretChange?.(q.getText(), q.getSelection()?.index ?? null);
+        onEmptyChange?.(q.getLength() <= 1);
+        onCaretChange?.(getTextWithEmbeds(q), q.getSelection()?.index ?? null);
       });
       // Also fires on caret moves that don't change text (click, arrow keys) —
       // needed so opening/closing the mention popover tracks cursor position,
       // not just edits. Range is null on blur, which closes the popover.
       q.on('selection-change', (range) => {
-        onCaretChange?.(q.getText(), range ? range.index : null);
+        onCaretChange?.(getTextWithEmbeds(q), range ? range.index : null);
       });
       if (autoFocus) q.focus();
 
