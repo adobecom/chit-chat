@@ -64,14 +64,20 @@ function uploadHandler(range, files) {
 // unit in the *real* document index space getSelection()/deleteText()/
 // insertText() all operate in (Parchment's default embed length is 1). Any
 // caller pairing getText() with getSelection().index desyncs the moment an
-// image sits before the caret. This mirrors that layout with a single
-// placeholder character per embed so index arithmetic against the returned
-// string lines up with Quill's real indices.
-function getTextWithEmbeds(quill) {
-  return quill.getContents().ops.reduce(
-    (acc, op) => acc + (typeof op.insert === 'string' ? op.insert : '￼'),
-    '',
-  );
+// image sits before the caret. Returns a same-length-mirrored string (one
+// placeholder char per embed) so index arithmetic against `text` lines up
+// with Quill's real indices, plus whether any embed is present at all — an
+// embed-only body (no text) must never read as "empty" the way a
+// getText().trim() check would, but a text-emptiness check still needs the
+// real trimmed text when there's no embed to fall back on.
+function analyzeContents(quill) {
+  let hasEmbed = false;
+  const text = quill.getContents().ops.reduce((acc, op) => {
+    if (typeof op.insert === 'string') return acc + op.insert;
+    hasEmbed = true;
+    return `${acc}￼`;
+  }, '');
+  return { text, hasEmbed };
 }
 
 // Native Unicode emoji, inserted as plain text — no allow-list/sanitizer
@@ -150,6 +156,10 @@ const QuillEditor = forwardRef(function QuillEditor(
       if (quillRef.current) return quillRef.current.root.innerHTML;
       return mountRef.current?.querySelector('textarea')?.value ?? '';
     },
+    // Quill's getText() silently drops embeds (see analyzeContents above) —
+    // fine for plain callers that only care about literal typed text, but
+    // don't use this to decide "is there anything to post"; that's what
+    // onEmptyChange (embed-aware) is for.
     getText() {
       if (quillRef.current) return quillRef.current.getText().trim();
       return (mountRef.current?.querySelector('textarea')?.value ?? '').trim();
@@ -201,20 +211,25 @@ const QuillEditor = forwardRef(function QuillEditor(
       if (initialHtml) q.clipboard.dangerouslyPasteHTML(initialHtml);
       if (ariaLabel) q.root.setAttribute('aria-label', ariaLabel);
       quillRef.current = q;
-      // getLength() counts the doc's mandatory trailing newline, so an empty
-      // editor is always exactly 1 — including an embed (e.g. a lone pasted
-      // image) makes it >= 2. Unlike getText().trim(), this correctly treats
-      // an image-only body as non-empty.
-      onEmptyChange?.(q.getLength() <= 1);
+      // "Empty" means no embed AND nothing but whitespace typed — an embed
+      // (e.g. a lone pasted image) is never empty regardless of text, but
+      // getLength() alone can't stand in for a plain whitespace/trim check
+      // when there's no embed (a single space or a bare Enter both make
+      // getLength() >= 2 despite having nothing meaningful to post).
+      const reportEmpty = () => {
+        const { text, hasEmbed } = analyzeContents(q);
+        onEmptyChange?.(!hasEmbed && !text.trim());
+      };
+      reportEmpty();
       q.on('text-change', () => {
-        onEmptyChange?.(q.getLength() <= 1);
-        onCaretChange?.(getTextWithEmbeds(q), q.getSelection()?.index ?? null);
+        reportEmpty();
+        onCaretChange?.(analyzeContents(q).text, q.getSelection()?.index ?? null);
       });
       // Also fires on caret moves that don't change text (click, arrow keys) —
       // needed so opening/closing the mention popover tracks cursor position,
       // not just edits. Range is null on blur, which closes the popover.
       q.on('selection-change', (range) => {
-        onCaretChange?.(getTextWithEmbeds(q), range ? range.index : null);
+        onCaretChange?.(analyzeContents(q).text, range ? range.index : null);
       });
       if (autoFocus) q.focus();
 
