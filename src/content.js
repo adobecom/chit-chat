@@ -22,6 +22,25 @@
  * Guard against double-injection.
  */
 import { captureAnchor, resolveAnchor, finalizeAnchorForSave } from '@adobe/annotations-core/anchor';
+import { STATUS_COLORS } from '@adobe/annotations-core/colors';
+import { resolveMarkerPlacement, resolveShapePlacement } from '@adobe/annotations-core/marker-geometry';
+
+// Markers render on the host page, not inside chit-chat's own themed side
+// panel — its light/dark contrast needs depend on the host page's own
+// background, unrelated to the extension's panel-theme preference. The
+// overlay's injected stylesheet has never been theme-reactive (unlike the
+// shadow-root-scoped compose/picker UI, which toggles a `.cc-dark` class),
+// so use the light variant unconditionally rather than inventing new
+// theme-reactive infra a color-value fix doesn't call for.
+const OPEN_COLOR = STATUS_COLORS.open.light;
+const IN_PROGRESS_COLOR = STATUS_COLORS.in_progress.light;
+const RESOLVED_COLOR = STATUS_COLORS.resolved.light;
+
+// Translucent fill for shape markers — same status color, alpha-blended.
+function withAlpha(hex, alpha) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
 
 if (window.__chitChatLoaded) {
   // already running — ignore
@@ -72,17 +91,35 @@ if (window.__chitChatLoaded) {
                 font: bold 10px/1 sans-serif; color: #fff;
                 border: 2px solid #fff; box-sizing: border-box; }
       .cc-dot:hover { transform: translate(-50%,-50%) scale(1.2); }
-      /* Status ring colors (background is now per-user, set inline) */
-      .cc-dot--open        { border-color: #0265DC; }
-      .cc-dot--in_progress { border-color: #E68619; }
-      .cc-dot--resolved    { border-color: #2D9D78; }
-      .cc-dot--approximate { border-color: #E68619; }
+      /* Status ring colors (background is now per-user, set inline). Sourced
+         from @adobe/annotations-core/colors — the same S2 semantic values
+         this extension's own status badge already uses (open/notice,
+         in_progress/informative, resolved/positive), so the marker no longer
+         contradicts its own badge. */
+      .cc-dot--open        { border-color: ${OPEN_COLOR}; }
+      .cc-dot--in_progress { border-color: ${IN_PROGRESS_COLOR}; }
+      .cc-dot--resolved    { border-color: ${RESOLVED_COLOR}; }
       .cc-shape { position: absolute; pointer-events: all; cursor: pointer;
-                  border: 2px solid #0265DC; background: rgba(2,101,220,.08);
+                  border: 2px solid ${OPEN_COLOR}; background: ${withAlpha(OPEN_COLOR, 0.08)};
                   box-sizing: border-box; }
       .cc-shape--ellipse { border-radius: 50%; }
-      .cc-shape--in_progress { border-color: #E68619; background: rgba(230,134,25,.08); }
-      .cc-shape--resolved    { border-color: #2D9D78; background: rgba(45,157,120,.08); }
+      .cc-shape--in_progress { border-color: ${IN_PROGRESS_COLOR}; background: ${withAlpha(IN_PROGRESS_COLOR, 0.08)}; }
+      .cc-shape--resolved    { border-color: ${RESOLVED_COLOR}; background: ${withAlpha(RESOLVED_COLOR, 0.08)}; }
+      /* Anchor-resolution dimming — a separate visual channel (opacity/
+         filter) from the workflow-status border-color rules above, so the
+         two independent signals (workflow status vs. anchor-match
+         confidence) can't fight over the same CSS property. data-status
+         mirrors milo-logs-deploy's DotMarker.js/ShapeMarker.js convention
+         exactly (this repo's markers had no viewport-visibility distinction
+         at all before — every dot rendered full-opacity regardless of
+         whether its element was actually on-screen, or even resolved). */
+      .cc-dot[data-status="offscreen"], .cc-shape[data-status="offscreen"] { opacity: .35; }
+      .cc-dot[data-status="hidden"] { display: none; }
+      .cc-dot[data-status="unanchored"] { opacity: .25; filter: grayscale(1); }
+      /* Uncertain (fuzzy tag-wide text match) rather than a confident
+         selector/XPath hit — distinct from, and layered independently of,
+         the viewport-visibility dimming above. */
+      .cc-dot[data-confidence="approximate"] { opacity: .7; }
       /* element-picker highlight overlay */
       #cc-element-picker { position: fixed; inset: 0; z-index: 2147483641;
                            pointer-events: none; }
@@ -223,8 +260,12 @@ if (window.__chitChatLoaded) {
       if (!res) continue;
       if (t.anchor?.type === 'shape') {
         renderShapeMarker(overlay, t);
-      } else if (res.element) {
-        renderDotMarker(overlay, t, res.element);
+      } else {
+        // Render even when res.element is null (anchor didn't resolve) —
+        // resolveMarkerPlacement falls back to the anchor's stored
+        // boundingRect and reports 'unanchored', so the dot still shows up
+        // (dimmed/grayscale) instead of silently vanishing from the overlay.
+        renderDotMarker(overlay, t, res);
       }
     }
   }
@@ -284,28 +325,37 @@ if (window.__chitChatLoaded) {
     return dot;
   }
 
-  function renderDotMarker(overlay, thread, el) {
-    const rect = el.getBoundingClientRect();
+  // `res` is resolveAnchor's { element, status } — element may be null
+  // (anchor never resolved to anything; resolveMarkerPlacement falls back to
+  // the anchor's stored boundingRect for a static position). status is the
+  // anchor-match confidence (resolved/approximate/unanchored), independent
+  // of dataset.status below (viewport visibility) — approximate gets its own
+  // lighter dim via data-confidence so the two signals don't fight over the
+  // same visual channel.
+  function renderDotMarker(overlay, thread, res) {
+    const placement = resolveMarkerPlacement(res.element, thread.anchor);
     const dot = createCommenterDot(thread);
-    // Overlay is position:fixed — use viewport coords directly (no scroll offset).
-    dot.style.left = `${rect.left + rect.width / 2}px`;
-    dot.style.top = `${rect.top}px`;
+    // Overlay is position:fixed — placement.left/top are already viewport coords.
+    dot.style.left = `${placement.left + placement.width / 2}px`;
+    dot.style.top = `${placement.top}px`;
+    dot.dataset.status = placement.status;
+    if (res.status === 'approximate') dot.dataset.confidence = 'approximate';
     overlay.appendChild(dot);
   }
 
   function renderShapeMarker(overlay, thread) {
     const a = thread.anchor;
+    const placement = resolveShapePlacement(a);
     const shape = document.createElement('div');
     const statusMod = (thread.status === 'in_progress' || thread.status === 'resolved')
       ? ` cc-shape--${thread.status}` : '';
     shape.className = `cc-shape${a.shape === 'ellipse' ? ' cc-shape--ellipse' : ''}${statusMod}`;
-    // Shape anchors are stored as page (document) coordinates. Overlay is
-    // position:fixed, so subtract scroll to convert to viewport coordinates.
-    shape.style.left = `${a.left - window.scrollX}px`;
-    shape.style.top = `${a.top - window.scrollY}px`;
-    shape.style.width = `${a.width}px`;
-    shape.style.height = `${a.height}px`;
+    shape.style.left = `${placement.left}px`;
+    shape.style.top = `${placement.top}px`;
+    shape.style.width = `${placement.width}px`;
+    shape.style.height = `${placement.height}px`;
     shape.dataset.threadId = thread.id;
+    shape.dataset.status = placement.status;
     shape.addEventListener('click', () => toPanel('cc:panel:dotClicked', { threadId: thread.id }));
     overlay.appendChild(shape);
 
@@ -326,22 +376,24 @@ if (window.__chitChatLoaded) {
     if (!overlay) return;
     for (const dot of overlay.querySelectorAll('.cc-dot')) {
       const tid = dot.dataset.threadId;
+      // dataset values are always strings; stringify the id so numeric backend
+      // ids still match threads found by object key elsewhere.
+      const t = _threads.find((x) => String(x.id) === tid);
+      if (!t?.anchor) continue;
       const res = _resolvedMap[tid];
-      if (!res?.element) continue;
-      const rect = res.element.getBoundingClientRect();
-      dot.style.left = `${rect.left + rect.width / 2}px`;
-      dot.style.top = `${rect.top}px`;
+      const placement = resolveMarkerPlacement(res?.element ?? null, t.anchor);
+      dot.style.left = `${placement.left + placement.width / 2}px`;
+      dot.style.top = `${placement.top}px`;
+      dot.dataset.status = placement.status;
     }
     for (const shape of overlay.querySelectorAll('.cc-shape')) {
       const tid = shape.dataset.threadId;
-      // dataset values are always strings; stringify the id so numeric backend
-      // ids still match (otherwise shapes freeze at their initial position on
-      // scroll while dot markers — which look up by object key — track fine).
       const t = _threads.find((x) => String(x.id) === tid);
       if (!t?.anchor) continue;
-      const a = t.anchor;
-      shape.style.left = `${a.left - window.scrollX}px`;
-      shape.style.top = `${a.top - window.scrollY}px`;
+      const placement = resolveShapePlacement(t.anchor);
+      shape.style.left = `${placement.left}px`;
+      shape.style.top = `${placement.top}px`;
+      shape.dataset.status = placement.status;
     }
   }
 
