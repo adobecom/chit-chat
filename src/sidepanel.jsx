@@ -40,7 +40,15 @@ import {
   Avatar,
 } from '@react-spectrum/s2';
 import { sanitizeHtml, stripHtml } from '@adobe/annotations-core/sanitize';
-import QuillEditor from './QuillEditor.jsx';
+import { STATUS_BADGE_VARIANT } from '@adobe/annotations-core/colors';
+import QuillEditor from '@adobe/annotations-core/QuillEditor';
+// Quill itself (and its CSS) is bundled here, not lazy-loaded, since the side
+// panel's CSP is script-src 'self' — nothing can load from a CDN. Passed to
+// the shared QuillEditor via loadQuill; milo-logs-deploy's client instead
+// passes its own CDN-lazy loader (see QuillEditor.jsx's header comment for why).
+import Quill from 'quill';
+import 'quill/dist/quill.snow.css';
+import EmojiIcon from '@react-spectrum/s2/icons/Emoji';
 import BrightnessContrastIcon from '@react-spectrum/s2/icons/BrightnessContrast';
 import ChevronLeftIcon from '@react-spectrum/s2/icons/ChevronLeft';
 import CircleIcon from '@react-spectrum/s2/icons/Circle';
@@ -53,6 +61,13 @@ import SelectRectangleIcon from '@react-spectrum/s2/icons/SelectRectangle';
 import TargetIcon from '@react-spectrum/s2/icons/Target';
 import ThumbDownIcon from '@react-spectrum/s2/icons/ThumbDown';
 import ThumbUpIcon from '@react-spectrum/s2/icons/ThumbUp';
+
+// Quill is already loaded (static import above) — the shared QuillEditor's
+// loadQuill prop exists so milo-logs-deploy's client can lazy-load from a CDN
+// instead; here it just resolves immediately. Defined once at module scope
+// (not per-render) since it's passed to every QuillEditor instance.
+const loadQuill = () => Promise.resolve(Quill);
+const renderEmojiIcon = () => <EmojiIcon aria-hidden UNSAFE_className="cc-emoji-icon" />;
 
 // Caps a comment body defensively — base64 screenshots can bloat it into the
 // MBs, and neither the API proxy nor the backend's body-column limit is guarded.
@@ -178,11 +193,11 @@ function statusLabel(status) {
 }
 
 // S2 Badge variant per status — colored text/pill with theme-safe contrast
-// in both light and dark (S2 owns the fg/bg pairing).
+// in both light and dark (S2 owns the fg/bg pairing). Shared with
+// milo-logs-deploy's ThreadCard.js, which independently landed on this same
+// mapping — single source of truth now instead of two maps that happen to agree.
 function statusBadgeVariant(status) {
-  if (status === 'in_progress') return 'informative';
-  if (status === 'resolved') return 'positive';
-  return 'notice'; // 'open' or undefined
+  return STATUS_BADGE_VARIANT[status] ?? STATUS_BADGE_VARIANT.open; // 'open' or undefined
 }
 
 // The author_name we stamp on comments this user creates — single source of
@@ -1188,6 +1203,8 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         >
           <QuillEditor
             ref={replyEditorRef}
+            loadQuill={loadQuill}
+            renderEmojiIcon={renderEmojiIcon}
             placeholder="Reply… (@ to mention someone)"
             aria-label="Reply text"
             onEmptyChange={setReplyEmpty}
@@ -1356,6 +1373,8 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
           >
             <QuillEditor
               ref={editorRef}
+              loadQuill={loadQuill}
+              renderEmojiIcon={renderEmojiIcon}
               initialHtml={comment.body ?? ''}
               aria-label="Edit comment text"
               onEmptyChange={setEditEmpty}
