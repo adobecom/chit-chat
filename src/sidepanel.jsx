@@ -16,13 +16,14 @@
  *   theme      — 'light'|'dark'
  */
 
-import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useContext, useRef, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import '@react-spectrum/s2/page.css';
 import '../sidepanel.css';
 import {
   Provider,
+  ColorSchemeContext,
   Button,
   ActionButton,
   ToggleButton,
@@ -250,6 +251,14 @@ function App() {
   useEffect(() => {
     if (themeHydrated.current) storage.set('theme', theme);
   }, [theme]);
+  // Force the style/layout recalc that color-scheme's flip triggers (S2's
+  // Provider sets it as an inherited custom property feeding hundreds of
+  // light-dark() declarations) to happen synchronously in this task, instead
+  // of Chrome deferring it to the side panel's next (throttled, ~1s) paint —
+  // extension side panels get background-tab-style RAF/style throttling even
+  // while visible unless they hold window focus. Reading a layout property
+  // forces the pending recalc to flush right now.
+  useLayoutEffect(() => { void document.body.offsetHeight; }, [theme]);
 
   // ── Auth ─────────────────────────────────────────────────────────────────
   const refreshAuth = useCallback(async () => {
@@ -893,6 +902,13 @@ function useMentionPicker(editorRef, mentions, setMentions) {
 // points at the compose box (or picker container) the list opens against.
 function MentionSuggestions({ results, activeIndex, onPick, onHover, anchorRef }) {
   const [style, setStyle] = useState(null);
+  // Provider sets color-scheme on its own div, which the popover's light-dark()
+  // colors would normally inherit — but a document.body portal renders as a
+  // sibling of that div, not a descendant, so it fell back to the OS/browser
+  // default (looking dark-only whenever that default is dark) instead of
+  // following the in-app theme toggle. Read the resolved scheme from context
+  // and set it directly on the portaled element instead of relying on inheritance.
+  const colorScheme = useContext(ColorSchemeContext);
 
   useLayoutEffect(() => {
     const anchor = anchorRef?.current;
@@ -908,6 +924,7 @@ function MentionSuggestions({ results, activeIndex, onPick, onHover, anchorRef }
         position: 'fixed',
         left: rect.left,
         width: rect.width,
+        colorScheme: colorScheme || 'light dark',
         ...(flipUp ? { bottom: window.innerHeight - rect.top + 4 } : { top: rect.bottom + 4 }),
       });
     }
@@ -921,7 +938,7 @@ function MentionSuggestions({ results, activeIndex, onPick, onHover, anchorRef }
       window.removeEventListener('scroll', reposition, true);
       window.removeEventListener('resize', reposition);
     };
-  }, [results.length, anchorRef]);
+  }, [results.length, anchorRef, colorScheme]);
 
   if (!results.length || !style) return null;
 
