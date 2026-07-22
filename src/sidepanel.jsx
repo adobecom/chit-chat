@@ -16,8 +16,9 @@
  *   theme      — 'light'|'dark'
  */
 
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createPortal } from 'react-dom';
 import '@react-spectrum/s2/page.css';
 import '../sidepanel.css';
 import {
@@ -786,6 +787,10 @@ function ThreadCard({ thread, resolution, onClick }) {
 
 const MENTION_SEARCH_DEBOUNCE_MS = 150;
 
+// Matches .cc-mention-popover's CSS box (margin-top + border + max-height) —
+// used to decide whether the popover fits below the anchor or must flip above it.
+const MENTION_POPOVER_SPACE_PX = 190;
+
 // Finds the in-progress "@query" ending at `caret`. Requires whitespace/
 // start-of-string before "@" (so "foo@adobe.com" doesn't trigger it), and
 // closes on a space (multi-word names must be picked from the list).
@@ -880,10 +885,48 @@ function useMentionPicker(editorRef, mentions, setMentions) {
   };
 }
 
-function MentionSuggestions({ results, activeIndex, onPick, onHover }) {
-  if (!results.length) return null;
-  return (
-    <div className="cc-mention-popover" role="listbox" aria-label="Mention suggestions">
+// Positioned relative to the viewport (not the compose box) and rendered into
+// a document.body portal, so ancestor `overflow` on .cc-detail/.cc-comments
+// can't clip it — a plain absolutely-positioned child of .cc-mention-compose
+// was clipped whenever the reply box sat near the bottom of the side panel or
+// the editor was mid-thread inside the scrolled comment list. `anchorRef`
+// points at the compose box (or picker container) the list opens against.
+function MentionSuggestions({ results, activeIndex, onPick, onHover, anchorRef }) {
+  const [style, setStyle] = useState(null);
+
+  useLayoutEffect(() => {
+    const anchor = anchorRef?.current;
+    if (!results.length || !anchor) { setStyle(null); return undefined; }
+
+    function reposition() {
+      const rect = anchor.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - rect.bottom;
+      // Flip above the anchor when there isn't room below — the common case
+      // for a reply box pinned near the bottom of the panel.
+      const flipUp = spaceBelow < MENTION_POPOVER_SPACE_PX;
+      setStyle({
+        position: 'fixed',
+        left: rect.left,
+        width: rect.width,
+        ...(flipUp ? { bottom: window.innerHeight - rect.top + 4 } : { top: rect.bottom + 4 }),
+      });
+    }
+
+    reposition();
+    // Ancestor scrolling (.cc-comments) or a panel resize moves the anchor —
+    // recompute so the popover tracks it instead of drifting away.
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
+    return () => {
+      window.removeEventListener('scroll', reposition, true);
+      window.removeEventListener('resize', reposition);
+    };
+  }, [results.length, anchorRef]);
+
+  if (!results.length || !style) return null;
+
+  return createPortal(
+    <div className="cc-mention-popover" role="listbox" aria-label="Mention suggestions" style={style}>
       {results.map((person, i) => (
         <button
           type="button"
@@ -902,7 +945,8 @@ function MentionSuggestions({ results, activeIndex, onPick, onHover }) {
           </span>
         </button>
       ))}
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -929,6 +973,8 @@ function AssigneePicker({ thread, onUpdate, onError }) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState([]);
   const [saving, setSaving] = useState(false);
+  // Anchor for the mention popover's portal positioning (see MentionSuggestions).
+  const pickerRef = useRef(null);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -983,7 +1029,7 @@ function AssigneePicker({ thread, onUpdate, onError }) {
       {!open ? (
         <ActionButton isQuiet size="S" onPress={() => setOpen(true)}>+ Assign</ActionButton>
       ) : (
-        <div className="cc-assignee-picker">
+        <div ref={pickerRef} className="cc-assignee-picker">
           <SearchField
             aria-label="Search people to assign"
             placeholder="Assign to…"
@@ -992,7 +1038,13 @@ function AssigneePicker({ thread, onUpdate, onError }) {
             autoFocus
             size="S"
           />
-          <MentionSuggestions results={results} activeIndex={-1} onPick={assign} onHover={() => {}} />
+          <MentionSuggestions
+            results={results}
+            activeIndex={-1}
+            onPick={assign}
+            onHover={() => {}}
+            anchorRef={pickerRef}
+          />
           <ActionButton
             isQuiet
             size="S"
@@ -1013,6 +1065,8 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
   // Uncontrolled Quill instance (see QuillEditor) — track only whether it's
   // empty, to drive the Reply button's disabled state.
   const replyEditorRef = useRef(null);
+  // Anchor for the mention popover's portal positioning (see MentionSuggestions).
+  const replyComposeRef = useRef(null);
   const [replyEmpty, setReplyEmpty] = useState(true);
   const [replyMentions, setReplyMentions] = useState([]);
   const [posting, setPosting] = useState(false);
@@ -1180,6 +1234,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
       <div className="cc-reply-area">
         <MentionChips mentions={replyMentions} onRemove={mentionPicker.removeMention} />
         <div
+          ref={replyComposeRef}
           className="cc-mention-compose"
           onKeyDown={(e) => {
             if (mentionPicker.handleKeyDown(e)) { e.preventDefault(); return; }
@@ -1198,6 +1253,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
             activeIndex={mentionPicker.activeIndex}
             onPick={mentionPicker.pick}
             onHover={mentionPicker.setActiveIndex}
+            anchorRef={replyComposeRef}
           />
         </div>
         <div className={`cc-reply-hint${replyError ? ' cc-reply-error' : ''}`}>
@@ -1241,6 +1297,8 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
   // Uncontrolled Quill instance, remounted fresh each time `editing` flips
   // true, seeded from comment.body — so it reflects the latest server body.
   const editorRef = useRef(null);
+  // Anchor for the mention popover's portal positioning (see MentionSuggestions).
+  const editComposeRef = useRef(null);
   // editMentions is (re-)seeded when the editor opens (see toggleEditor), not
   // just at mount, so it reflects the freshest server mentions if a poll
   // updated the comment in the meantime.
@@ -1348,6 +1406,7 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
           {/* ⌘/Ctrl+Enter saves — parity with the reply and compose boxes. @name opens the mention picker. */}
           <MentionChips mentions={editMentions} onRemove={mentionPicker.removeMention} />
           <div
+            ref={editComposeRef}
             className="cc-mention-compose"
             onKeyDown={(e) => {
               if (mentionPicker.handleKeyDown(e)) { e.preventDefault(); return; }
@@ -1367,6 +1426,7 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
               activeIndex={mentionPicker.activeIndex}
               onPick={mentionPicker.pick}
               onHover={mentionPicker.setActiveIndex}
+              anchorRef={editComposeRef}
             />
           </div>
           <div className={`cc-reply-hint${editError ? ' cc-reply-error' : ''}`}>
@@ -1378,18 +1438,10 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
           </div>
         </>
       ) : (
-        <>
-          <CommentBody body={comment.body} mentions={comment.mentions} />
-          {comment.mentions?.length > 0 && (
-            <TagGroup
-              aria-label="Mentioned people"
-              UNSAFE_className="cc-mention-chips"
-              items={comment.mentions.map((m) => ({ id: m.email, ...m }))}
-            >
-              {(item) => <Tag id={item.id}>{item.name}</Tag>}
-            </TagGroup>
-          )}
-        </>
+        // The inline "@name" highlight from CommentBody is the only mention
+        // indicator on a posted comment — no separate chip row (that duplicated
+        // it; see MentionChips for the removable chip row used while composing).
+        <CommentBody body={comment.body} mentions={comment.mentions} />
       )}
 
       <div className="cc-vote-row">
