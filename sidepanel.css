@@ -474,23 +474,23 @@ html, body {
 
 /* ── @-mention picker ────────────────────────────────────────────────────── */
 
-/* Positioning anchor for the floating suggestion list below the textarea. */
 .cc-mention-compose {
   position: relative;
 }
 
-/* Selected-mentions chip row (TagGroup) above the compose field, or below a rendered body. */
+/* Selected-mentions chip row (TagGroup) above the compose field. */
 .cc-mention-chips {
   margin-bottom: 6px;
 }
 
+/* Rendered into a document.body portal and positioned via inline style
+   (top/bottom/left/width from the anchor's getBoundingClientRect(), see
+   MentionSuggestions) rather than CSS position:absolute — a plain
+   absolutely-positioned child of .cc-mention-compose was clipped by
+   ancestor overflow (.cc-detail, .cc-comments). */
 .cc-mention-popover {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  right: 0;
+  position: fixed;
   z-index: 20;
-  margin-top: 4px;
   max-height: 180px;
   overflow-y: auto;
   border-radius: 8px;
