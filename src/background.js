@@ -341,6 +341,21 @@ async function handleMessage(msg, sender) {
     if (!token) return { signedIn: false };
     return { signedIn: true, profile: await getProfile() };
   }
+  // Hands the raw IMS token + API base to the side panel so it can hold the SSE
+  // stream itself. This is the ONE deliberate exception to "all network I/O
+  // lives in the service worker" (see the file header): EventSource/streaming
+  // fetch is unavailable in an MV3 service worker (EventSource isn't exposed in
+  // ServiceWorkerGlobalScope, and a SW is evicted after ~30s idle, which a
+  // long-lived stream cannot survive). The panel document has no such limits and
+  // lives exactly as long as the stream should.
+  //
+  // Non-interactive on purpose: the stream is background machinery and must
+  // never pop a sign-in window. No token → the panel just keeps polling.
+  if (type === 'cc:auth:streamToken') {
+    const token = await getToken();
+    if (!token) return { token: null, apiBase: API_BASE, clientId: CLIENT_ID };
+    return { token, apiBase: API_BASE, clientId: CLIENT_ID };
+  }
 
   // ── Forward from panel → content script of a tab ──────────────────────
   // The side panel passes msg.tabId for routing.

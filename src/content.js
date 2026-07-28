@@ -24,6 +24,9 @@
 import { captureAnchor, resolveAnchor, finalizeAnchorForSave } from '@adobe/annotations-core/anchor';
 import { STATUS_COLORS } from '@adobe/annotations-core/colors';
 import { resolveMarkerPlacement, resolveShapePlacement } from '@adobe/annotations-core/marker-geometry';
+import {
+  MAX_GROUP_AVATARS, authorInitial, buildOverlayModel, groupTooltip,
+} from '@adobe/annotations-core/overlay-model';
 
 // Markers render on the host page, not inside chit-chat's own themed side
 // panel — its light/dark contrast needs depend on the host page's own
@@ -99,6 +102,23 @@ if (window.__chitChatLoaded) {
       .cc-dot--open        { border-color: ${OPEN_COLOR}; }
       .cc-dot--in_progress { border-color: ${IN_PROGRESS_COLOR}; }
       .cc-dot--resolved    { border-color: ${RESOLVED_COLOR}; }
+      /* Stacked marker for co-located threads (buildOverlayModel's 'group'
+         descriptor) — mirrors milo's .pc-dot-group. Positioned like .cc-dot
+         (translate(-50%,-50%) off the anchor's center) so a cluster sits exactly
+         where the single dot it replaces would have. */
+      .cc-dot-group { position: absolute; display: flex; align-items: center;
+                      cursor: pointer; pointer-events: all;
+                      transform: translate(-50%,-50%); }
+      .cc-dot-group-avatar { width: 22px; height: 22px; flex: 0 0 auto;
+                             display: flex; align-items: center; justify-content: center;
+                             border-radius: 50%; border: 2px solid #fff;
+                             box-sizing: border-box; color: #fff;
+                             font: bold 10px/1 sans-serif;
+                             box-shadow: 0 1px 4px rgba(0,0,0,.3);
+                             transition: transform .12s; position: relative; }
+      .cc-dot-group-avatar:not(:first-child) { margin-left: -6px; }
+      .cc-dot-group:hover .cc-dot-group-avatar { transform: scale(1.15); }
+      .cc-dot-group-overflow { background: #606060 !important; font-size: 9px; }
       .cc-shape { position: absolute; pointer-events: all; cursor: pointer;
                   border: 2px solid ${OPEN_COLOR}; background: ${withAlpha(OPEN_COLOR, 0.08)};
                   box-sizing: border-box; }
@@ -113,9 +133,10 @@ if (window.__chitChatLoaded) {
          exactly (this repo's markers had no viewport-visibility distinction
          at all before — every dot rendered full-opacity regardless of
          whether its element was actually on-screen, or even resolved). */
-      .cc-dot[data-status="offscreen"], .cc-shape[data-status="offscreen"] { opacity: .35; }
-      .cc-dot[data-status="hidden"] { display: none; }
-      .cc-dot[data-status="unanchored"] { opacity: .25; filter: grayscale(1); }
+      .cc-dot[data-status="offscreen"], .cc-shape[data-status="offscreen"],
+      .cc-dot-group[data-status="offscreen"] { opacity: .35; }
+      .cc-dot[data-status="hidden"], .cc-dot-group[data-status="hidden"] { display: none; }
+      .cc-dot[data-status="unanchored"], .cc-dot-group[data-status="unanchored"] { opacity: .25; filter: grayscale(1); }
       /* Uncertain (fuzzy tag-wide text match) rather than a confident
          selector/XPath hit — distinct from the viewport-visibility dimming
          above, but both drive opacity, so they can't just be declared
@@ -127,8 +148,10 @@ if (window.__chitChatLoaded) {
          combined selector below has higher specificity than either alone,
          so a dot that's both off-screen AND an uncertain match gets its own
          (lower) opacity instead of one signal clobbering the other. */
-      .cc-dot[data-confidence="approximate"] { opacity: .7; }
-      .cc-dot[data-status="offscreen"][data-confidence="approximate"] { opacity: .25; }
+      .cc-dot[data-confidence="approximate"],
+      .cc-dot-group[data-confidence="approximate"] { opacity: .7; }
+      .cc-dot[data-status="offscreen"][data-confidence="approximate"],
+      .cc-dot-group[data-status="offscreen"][data-confidence="approximate"] { opacity: .25; }
       /* element-picker highlight overlay */
       #cc-element-picker { position: fixed; inset: 0; z-index: 2147483641;
                            pointer-events: none; }
@@ -260,21 +283,38 @@ if (window.__chitChatLoaded) {
   let _threads = []; // cached from last cc:content:threads message
   let _resolvedMap = {}; // threadId → { element, status }
   let _theme = 'light'; // synced from the panel's chrome.storage.sync 'theme' setting
+  // Mirrors the panel's status filter so the overlay shows the same subset the
+  // list does. 'all' matches the panel's own default (see sidepanel.jsx) —
+  // deliberately NOT milo's default, which hides resolved threads: changing the
+  // extension's filter semantics is a UX decision, not part of sharing the model.
+  let _statusFilter = 'all';
 
+  // Which markers exist — filtering (orphaned threads, status) and clustering of
+  // co-located threads — comes from @adobe/annotations-core/overlay-model, shared
+  // with milo's in-page client. Before that was shared this function rendered one
+  // dot per thread with no filter, so orphaned threads still produced markers at
+  // stale positions and dots on the same element stacked invisibly.
   function renderMarkers() {
     const overlay = ensureOverlay();
     overlay.innerHTML = '';
-    for (const t of _threads) {
-      const res = _resolvedMap[t.id];
-      if (!res) continue;
-      if (t.anchor?.type === 'shape') {
-        renderShapeMarker(overlay, t);
+    const markers = buildOverlayModel(_threads, { statusFilter: _statusFilter });
+    for (const marker of markers) {
+      if (marker.kind === 'shape') {
+        renderShapeMarker(overlay, marker.thread);
+        continue;
+      }
+      // resolveAll keys by thread id; a thread present in the model always has an
+      // entry, but tolerate a missing one (a marker rendered before resolution
+      // completes) by treating it as unresolved rather than skipping the marker.
+      const res = _resolvedMap[marker.thread.id] ?? { element: null, status: 'unanchored' };
+      if (marker.kind === 'group') {
+        renderGroupMarker(overlay, marker, res);
       } else {
         // Render even when res.element is null (anchor didn't resolve) —
         // resolveMarkerPlacement falls back to the anchor's stored
         // boundingRect and reports 'unanchored', so the dot still shows up
         // (dimmed/grayscale) instead of silently vanishing from the overlay.
-        renderDotMarker(overlay, t, res);
+        renderDotMarker(overlay, marker.thread, res);
       }
     }
   }
@@ -322,8 +362,10 @@ if (window.__chitChatLoaded) {
     const author = thread.comments?.[0]?.author_name ?? '';
     dot.style.background = colorForUser(author);
 
-    // Show the author's first initial inside the dot (mirrors milo DotMarker.js).
-    dot.textContent = (author || '?')[0].toUpperCase();
+    // Show the author's first initial inside the dot. authorInitial is shared
+    // with milo's markers, so an anonymous commenter reads as '?' in both
+    // clients rather than as 'A' (indistinguishable from a real name).
+    dot.textContent = authorInitial(author);
 
     // Shape markers nest this dot inside their own click target — stop the
     // click from also bubbling to the shape's handler and double-firing.
@@ -350,6 +392,58 @@ if (window.__chitChatLoaded) {
     dot.dataset.status = placement.status;
     if (res.status === 'approximate') dot.dataset.confidence = 'approximate';
     overlay.appendChild(dot);
+  }
+
+  /**
+   * Stacked marker for co-located threads (or one thread with several
+   * commenters) — the Figma/Vercel-style cluster milo has had and this client
+   * did not, which is why overlapping dots used to pile up here.
+   *
+   * `marker` is an overlay-model descriptor: { threads, status, shownAuthors,
+   * overflow, count }. Built as plain DOM (no React) to keep this
+   * injected-into-every-page bundle dependency-free, but the CLUSTERING
+   * DECISIONS — which threads group, which status wins, the tooltip text — are
+   * the shared ones.
+   */
+  function renderGroupMarker(overlay, marker, res) {
+    const anchorThread = marker.anchorThread;
+    const placement = resolveMarkerPlacement(res.element, anchorThread.anchor);
+
+    const group = document.createElement('div');
+    group.className = 'cc-dot-group';
+    group.dataset.threadId = anchorThread.id;
+    group.dataset.status = placement.status;
+    if (res.status === 'approximate') group.dataset.confidence = 'approximate';
+    group.style.left = `${placement.left + placement.width / 2}px`;
+    group.style.top = `${placement.top}px`;
+    group.title = groupTooltip(marker);
+
+    marker.shownAuthors.forEach((author, i) => {
+      const avatar = document.createElement('div');
+      avatar.className = `cc-dot-group-avatar cc-dot--${marker.status}`;
+      avatar.style.background = colorForUser(author);
+      // Later avatars sit behind earlier ones, matching milo's stacking order.
+      avatar.style.zIndex = String(marker.shownAuthors.length - i);
+      avatar.textContent = authorInitial(author);
+      group.appendChild(avatar);
+    });
+
+    if (marker.overflow > 0) {
+      const more = document.createElement('div');
+      more.className = 'cc-dot-group-avatar cc-dot-group-overflow';
+      more.style.zIndex = '0';
+      more.textContent = `+${marker.overflow}`;
+      group.appendChild(more);
+    }
+
+    // Opening the first thread in the cluster mirrors milo's behaviour; the
+    // panel then shows the full list.
+    group.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toPanel('cc:panel:dotClicked', { threadId: anchorThread.id });
+    });
+
+    overlay.appendChild(group);
   }
 
   function renderShapeMarker(overlay, thread) {
@@ -383,17 +477,21 @@ if (window.__chitChatLoaded) {
   function repositionMarkers() {
     const overlay = document.getElementById('cc-overlay');
     if (!overlay) return;
-    for (const dot of overlay.querySelectorAll('.cc-dot')) {
-      const tid = dot.dataset.threadId;
+    // Top-level dots and stacked group markers reposition identically (both are
+    // anchored to an element), so they share one pass. `:scope >` excludes the
+    // commenter dot nested inside a shape marker, which is positioned relative
+    // to its shape parent and must not be moved to viewport coords.
+    for (const el of overlay.querySelectorAll(':scope > .cc-dot, :scope > .cc-dot-group')) {
+      const tid = el.dataset.threadId;
       // dataset values are always strings; stringify the id so numeric backend
       // ids still match threads found by object key elsewhere.
       const t = _threads.find((x) => String(x.id) === tid);
       if (!t?.anchor) continue;
       const res = _resolvedMap[tid];
       const placement = resolveMarkerPlacement(res?.element ?? null, t.anchor);
-      dot.style.left = `${placement.left + placement.width / 2}px`;
-      dot.style.top = `${placement.top}px`;
-      dot.dataset.status = placement.status;
+      el.style.left = `${placement.left + placement.width / 2}px`;
+      el.style.top = `${placement.top}px`;
+      el.dataset.status = placement.status;
     }
     for (const shape of overlay.querySelectorAll('.cc-shape')) {
       const tid = shape.dataset.threadId;
@@ -1135,6 +1233,11 @@ if (window.__chitChatLoaded) {
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'cc:content:threads') {
       _threads = msg.threads ?? [];
+      // The panel sends its current status filter alongside the threads so the
+      // overlay shows the same subset the list does. Absent (older panel build,
+      // or a message that predates this field) falls back to the current value
+      // rather than silently resetting the overlay to 'all'.
+      if (msg.statusFilter !== undefined) _statusFilter = msg.statusFilter;
       _resolvedMap = resolveAll(_threads);
       renderMarkers();
       toPanel('cc:panel:resolutionUpdated', {
