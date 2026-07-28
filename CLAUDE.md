@@ -8,11 +8,47 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm run build       # one-shot production build (minified)
 npm run watch       # development watch mode (unminified, rebuilds on change)
 npm run icons       # regenerate icon PNGs
+npm test            # vitest + jsdom (pure helpers from sidepanel.jsx)
 ```
 
-There is no test runner or linter configured.
+No linter is configured.
 
 After building, reload the unpacked extension at `chrome://extensions` to pick up changes.
+
+### Tests
+
+`vitest run`, jsdom environment, specs in `test/`. Scope is deliberately narrow —
+the **pure helpers** exported from `src/sidepanel.jsx` (mention highlighting,
+`findMentionQuery`, identity/status helpers) plus the points where they sit on top
+of `@adobe/annotations-core`. Two constraints shape this:
+
+- The S2 component tree is **not** rendered in tests. `sidepanel.jsx` imports
+  `@react-spectrum/s2` and its CSS, which only resolve through `build.mjs`'s
+  esbuild loaders; `vitest.config.js` inlines S2/Quill and sets `css: false` so
+  the module can at least be *imported*.
+- Importing `sidepanel.jsx` runs its module-scope
+  `createRoot(...).render(<App/>)` bootstrap. `test/setup.js` provides a `#root`
+  container and a no-op `chrome.*` stub so that mounts harmlessly instead of
+  throwing. Don't restructure the bootstrap purely for tests.
+
+Helpers must be `export`ed to be testable (nothing in `src/` was exported before
+this suite existed).
+
+### Testing a change to @adobe/annotations-core
+
+This extension consumes the **published** package, so a core change is invisible
+here until it ships. To build against an unpublished core, run from a
+`milo-logs-deploy` checkout:
+
+```bash
+scripts/link-annotations-core.sh              # symlinks its working-tree core in
+npm run build                                  # …then reload the extension
+scripts/link-annotations-core.sh --unlink     # restore the published tarball
+```
+
+Always `--unlink` before committing: the link only touches `node_modules`, but
+`dist/` is committed here, so a build made against a linked core would ship
+unpublished code.
 
 ## Architecture
 

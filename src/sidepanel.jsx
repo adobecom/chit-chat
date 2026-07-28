@@ -89,7 +89,7 @@ async function toContent(tabId, type, payload = {}) {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-function relTime(iso) {
+export function relTime(iso) {
   const diff = (Date.now() - new Date(iso)) / 1000;
   if (diff < 60) return 'just now';
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
@@ -99,7 +99,7 @@ function relTime(iso) {
 
 // Absolute date-time string, e.g. "Jul 10, 12:45 AM". Used inside a thread
 // (comments) where the precise time matters; the list keeps the terse relTime.
-function fmtDate(iso) {
+export function fmtDate(iso) {
   if (!iso) return '';
   return new Date(iso).toLocaleString(undefined, {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -109,7 +109,7 @@ function fmtDate(iso) {
 // Two-letter initials from a profile: first + last name initial
 // (e.g. John Doe → "JD"). Prefers structured given/family name parts, then
 // falls back to splitting the display name, then the email local part.
-function initials(profile) {
+export function initials(profile) {
   const first = profile?.first?.trim();
   const last = profile?.last?.trim();
   if (first && last) return (first[0] + last[0]).toUpperCase();
@@ -148,7 +148,7 @@ async function setMyVote(commentId, v) {
 // string/regex pass over the markup could match inside attribute values.
 // Walking text nodes via DOMParser (no browsing context, so no embedded
 // resource ever loads/fires here) keeps the rewrite scoped to visible text.
-function highlightMentionsHtml(html, mentions) {
+export function highlightMentionsHtml(html, mentions) {
   const names = [...new Set((mentions ?? []).map((m) => m.name?.trim()).filter(Boolean))]
     // Longest names first, so "@Alice Reza" isn't cut short by "@Alice" from another mention.
     .sort((a, b) => b.length - a.length)
@@ -186,7 +186,7 @@ function highlightMentionsHtml(html, mentions) {
 }
 
 // Human-readable status label. Undefined/null is treated as 'open'.
-function statusLabel(status) {
+export function statusLabel(status) {
   if (status === 'in_progress') return 'In progress';
   if (status === 'resolved') return 'Resolved';
   return 'Open';
@@ -196,13 +196,13 @@ function statusLabel(status) {
 // in both light and dark (S2 owns the fg/bg pairing). Shared with
 // milo-logs-deploy's ThreadCard.js, which independently landed on this same
 // mapping — single source of truth now instead of two maps that happen to agree.
-function statusBadgeVariant(status) {
+export function statusBadgeVariant(status) {
   return STATUS_BADGE_VARIANT[status] ?? STATUS_BADGE_VARIANT.open; // 'open' or undefined
 }
 
 // The author_name we stamp on comments this user creates — single source of
 // truth shared by comment creation and the ownership guard below.
-function myAuthorName(profile) {
+export function myAuthorName(profile) {
   return profile?.name ?? profile?.email ?? null;
 }
 
@@ -212,7 +212,7 @@ function myAuthorName(profile) {
 // comments that aren't the current user's. Limitations: identical display names
 // collide, and a changed profile name orphans a user from their old comments.
 // This is a courtesy guard, not a security boundary.
-function isMyComment(comment, profile) {
+export function isMyComment(comment, profile) {
   const me = myAuthorName(profile);
   return !!me && comment?.author_name === me;
 }
@@ -804,7 +804,7 @@ const MENTION_SEARCH_DEBOUNCE_MS = 150;
 // Finds the in-progress "@query" ending at `caret`. Requires whitespace/
 // start-of-string before "@" (so "foo@adobe.com" doesn't trigger it), and
 // closes on a space (multi-word names must be picked from the list).
-function findMentionQuery(text, caret) {
+export function findMentionQuery(text, caret) {
   if (caret == null) return null;
   const before = text.slice(0, caret);
   const match = before.match(/@([^\s@]*)$/);
