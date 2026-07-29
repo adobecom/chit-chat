@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<!--
+  Local harness for the side panel — NOT part of the extension.
+
+  Loads the REAL built dist/sidepanel.js with a stubbed chrome.* surface and a
+  fake service worker, so the panel's thread-store wiring can be exercised in a
+  real browser without signing in against prod (background.js's ENV is 'prod',
+  and sign-in goes through interactive IMS via chrome.identity).
+
+  Drive it from a browser check via:
+    window.__cc.pushStream(threads)   → deliver an SSE frame
+    window.__cc.serverThreads         → the mock server's mutable state
+    window.__cc.patches               → every PATCH the panel has sent
+    window.__cc.reportResolution(map) → stand in for the content script's
+                                        cc:panel:resolutionUpdated message
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Chit Chat harness</title>
+  <link rel="stylesheet" href="dist/sidepanel.css">
+<script>
+  const PAGE_URL = 'https://example.adobe.com/test-page';
+
+  const serverThreads = [
+    {
+      id: 'th-1', status: 'open', is_orphaned: false,
+      anchor: { type: 'element', tagName: 'P', textContent: 'First paragraph', cssSelector: 'p#one', xpath: '/html[1]/body[1]/p[1]' },
+      comments: [{ id: 'c1', thread_id: 'th-1', author_name: 'Bii Tester', body: '<p>First thread comment</p>', upvotes: 0, downvotes: 0, created_at: '2026-01-10T09:00:00Z' }],
+      created_at: '2026-01-10T09:00:00Z',
+    },
+    {
+      id: 'th-2', status: 'in_progress', is_orphaned: false,
+      anchor: { type: 'element', tagName: 'H1', textContent: 'Heading', cssSelector: 'h1', xpath: '/html[1]/body[1]/h1[1]' },
+      comments: [{ id: 'c2', thread_id: 'th-2', author_name: 'Okan Sahin', body: '<p>Second thread comment</p>', upvotes: 1, downvotes: 0, created_at: '2026-01-11T09:00:00Z' }],
+      created_at: '2026-01-11T09:00:00Z',
+    },
+  ];
+
+  const patches = [];
+  const streamListeners = [];
+
+  window.__cc = {
+    serverThreads,
+    patches,
+    pushStream(threads) {
+      const payload = JSON.stringify(threads ?? serverThreads);
+      for (const fn of streamListeners) fn(payload);
+    },
+    streamCount: () => streamListeners.length,
+    reportResolution(resolution) {
+      for (const fn of msgListeners) {
+        fn({ type: 'cc:panel:forward', payload: { type: 'cc:panel:resolutionUpdated', resolution } });
+      }
+    },
+    // The threads the panel currently believes in, read off the rendered list.
+    renderedStatuses: () => [...document.querySelectorAll('.cc-thread-card')].map((el) => el.textContent),
+  };
+
+  const msgListeners = [];
+
+  // ── Fake service worker ─────────────────────────────────────────────────
+  function handle(msg) {
+    switch (msg.type) {
+      case 'cc:auth:status':
+        return { signedIn: true, profile: { email: 'bii@adobe.com', name: 'Bii Tester', avatar: '' } };
+      case 'cc:auth:streamToken':
+        return { token: 'fake-token', apiBase: '/annotations', clientId: 'harness' };
+      case 'cc:api:fetchThreads':
+        return JSON.parse(JSON.stringify(serverThreads));
+      case 'cc:api:patchThread': {
+        patches.push({ id: msg.id, data: msg.data });
+        const t = serverThreads.find((x) => x.id === msg.id);
+        if (t) Object.assign(t, msg.data);
+        return JSON.parse(JSON.stringify(t ?? null));
+      }
+      case 'cc:api:searchPeople':
+        return [{ name: 'Alice Nguyen', email: 'alice@adobe.com', avatar: '' }];
+      case 'cc:tab:forward':
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  window.chrome = {
+    runtime: {
+      sendMessage: (msg) => Promise.resolve({ ok: true, result: handle(msg) }),
+      onMessage: {
+        addListener: (fn) => msgListeners.push(fn),
+        removeListener: (fn) => { const i = msgListeners.indexOf(fn); if (i >= 0) msgListeners.splice(i, 1); },
+      },
+      getURL: (p) => p,
+    },
+    tabs: {
+      query: (_q, cb) => cb([{ id: 1, windowId: 1, url: PAGE_URL }]),
+      get: (_id, cb) => cb({ id: 1, windowId: 1, url: PAGE_URL }),
+      onActivated: { addListener() {}, removeListener() {} },
+      onUpdated: { addListener() {}, removeListener() {} },
+      sendMessage: () => Promise.resolve(null),
+    },
+    storage: {
+      sync: {
+        get: (_k, cb) => cb({}),
+        set: (_v, cb) => cb?.(),
+      },
+    },
+    identity: { launchWebAuthFlow: () => {} },
+  };
+
+  // ── The SSE stream the realtime ladder opens ─────────────────────────────
+  // The panel reads it with fetch + ReadableStream (it cannot use a cookie from
+  // a chrome-extension:// origin), so the stream is stood up as a real
+  // ReadableStream whose controller stays open for __cc.pushStream.
+  const _fetch = window.fetch.bind(window);
+  window.fetch = function (url, opts) {
+    const u = String(typeof url === 'string' ? url : url.url);
+    if (u.includes('/annotations/events')) {
+      let ctrl;
+      const body = new ReadableStream({
+        start(c) {
+          ctrl = c;
+          const enc = new TextEncoder();
+          const send = (data) => { try { ctrl.enqueue(enc.encode(`data: ${data}\n\n`)); } catch {} };
+          streamListeners.push(send);
+          // First frame, as a live stream does on subscribe.
+          setTimeout(() => send(JSON.stringify(serverThreads)), 20);
+        },
+      });
+      return Promise.resolve(new Response(body, {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      }));
+    }
+    return _fetch(url, opts);
+  };
+</script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="dist/sidepanel.js"></script>
+</body>
+</html>

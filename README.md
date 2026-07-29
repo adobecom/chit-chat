@@ -23,6 +23,32 @@ Re-run `npm run build` after any code change, then click the reload icon on `chr
 
 For live development: `npm run watch` rebuilds on every change.
 
+⚠️ **The loaded extension talks to whichever environment `ENV` in `src/background.js`
+names, and that defaults to `prod`** — so exercising it writes REAL comments onto real
+pages. Flip that one constant to `'stage'` before testing anything you don't want
+persisted; `host_permissions` already covers both hosts.
+
+### Testing the panel without a real backend
+
+`harness.html` loads the real built `dist/sidepanel.js` against a stubbed `chrome.*`
+surface and a fake service worker — no sign-in, no network:
+
+```bash
+npm run build
+python3 -m http.server 7892 --directory .   # → http://localhost:7892/harness.html
+```
+
+It exposes hooks for the paths that are otherwise impractical to reach by hand:
+`__cc.pushStream(threads)` delivers an SSE frame at a chosen instant (the only way to
+exercise the optimistic-mutation guard), `__cc.reportResolution(map)` stands in for the
+content script's resolution report (driving the orphan lifecycle), and `__cc.patches`
+records every PATCH sent. Panel only — no on-page markers, since no content script runs.
+
+This is what `scripts/annotations-browser-check-extension.mjs` in the `milo-logs-deploy`
+repo drives (9 checks). Worth running after any change to the panel or to
+`@adobe/annotations-core`: it caught a dual-React bug that crashed every symlinked build
+and that no unit suite could see.
+
 ## Which pages does it work on?
 
 The overlay and API both work on **any page** — the extension uses `host_permissions` for `milo-core-prod.adobe.io` so API fetches bypass CORS entirely (unlike the bookmarklet, which is gated to CORS-allowlisted origins). However, the page's Content-Security-Policy may still block the content script from running on some pages.

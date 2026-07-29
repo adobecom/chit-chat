@@ -44,6 +44,7 @@ import { sanitizeHtml, stripHtml } from '@adobe/annotations-core/sanitize';
 import { STATUS_BADGE_VARIANT } from '@adobe/annotations-core/colors';
 import { eventsPath } from '@adobe/annotations-core/contract';
 import { createRealtimeConnection, pumpSseStream } from '@adobe/annotations-core/realtime';
+import { createThreadStore } from '@adobe/annotations-core/thread-store';
 import {
   MENTION_SEARCH_DEBOUNCE_MS, createMentionPicker, findMentionQuery,
 } from '@adobe/annotations-core/mentions';
@@ -78,11 +79,10 @@ const renderEmojiIcon = () => <EmojiIcon aria-hidden UNSAFE_className="cc-emoji-
 // Caps a comment body defensively — base64 screenshots can bloat it into the
 // MBs, and neither the API proxy nor the backend's body-column limit is guarded.
 const MAX_COMMENT_BODY_CHARS = 2_000_000; // ~2MB
-// How long after a local optimistic mutation an incoming SSE frame is ignored.
-// The backend re-broadcasts after every write, so the authoritative state lands
-// just after this window — long enough to cover the write's round trip, short
-// enough that a genuine remote change is never delayed noticeably.
-const MUTATION_GRACE_MS = 1_500;
+// The optimistic-mutation grace window that used to live here is now
+// DEFAULT_MUTATION_GRACE_MS in @adobe/annotations-core/thread-store, shared with
+// milo's in-page client (same 1500ms). Do not reintroduce a local copy — the
+// store applies it, so a second constant here would drift silently.
 
 const BODY_TOO_LARGE_MSG = "That comment is too large to post — try a smaller or cropped screenshot.";
 
@@ -259,25 +259,58 @@ function App() {
   // push effect can read current values without extra deps.
   const pageUrlRef = useRef('');
   const threadsUrlRef = useRef(null);
-  // Bumped on every optimistic local mutation (reply/edit/delete/vote/status).
-  // A fetch that started before a bump is dropped on arrival so an older
-  // in-flight poll can't clobber the optimistic state.
-  const mutationSeqRef = useRef(0);
-  // When the last optimistic mutation happened. The SSE stream needs a different
-  // guard from fetchThreads': a stream frame has no "request start" to compare a
-  // sequence number against, so instead frames are suppressed for a short window
-  // after a local mutation. The backend re-broadcasts after every write, so the
-  // authoritative state arrives right after the window closes — this trades a
-  // few hundred ms of staleness for never flickering a just-made change back to
-  // its old value.
-  const lastMutationAtRef = useRef(0);
 
-  // Records a local optimistic mutation for BOTH staleness guards at once, so
-  // the poll path and the stream path can never drift out of sync.
-  const noteLocalMutation = useCallback(() => {
-    mutationSeqRef.current += 1;
-    lastMutationAtRef.current = Date.now();
-  }, []);
+  // ── The shared thread store ──────────────────────────────────────────────
+  // Everything about WHICH update is allowed to land — the mutation sequence for
+  // in-flight fetches, the grace window for pushed stream frames, the catch-up
+  // re-fetch, and the whole orphan lifecycle — now lives in
+  // @adobe/annotations-core/thread-store, shared with milo's in-page client.
+  //
+  // The staleness guards came FROM here (milo had none, which was a live bug
+  // there). What this panel GAINS in return is the orphan lifecycle: it can now
+  // both mark a thread orphaned and, crucially, un-mark it when the anchor comes
+  // back — the recovery half it never had, and the reason content.js had to pass
+  // buildOverlayModel's `hideOrphaned: false` escape hatch.
+  //
+  // resolveAnchors is ASYNC here and not in milo, for a structural reason: the
+  // anchors live in the HOST PAGE, and this code runs in the side panel, which
+  // has no page access at all. The content script owns resolution and reports it
+  // by message (cc:panel:resolutionUpdated); the resolver below answers from that
+  // latest report rather than resolving anything itself.
+  const resolutionRef = useRef({});
+  // Set once the store exists, so the message handler can nudge it (the handler
+  // is registered in a stable effect and must not depend on the store).
+  const domChangedRef = useRef(null);
+  const refetchRef = useRef(null);
+
+  const store = useMemo(() => createThreadStore({
+    patchThread: (id, patch) => sw('cc:api:patchThread', { id, data: patch }),
+    // Resolution comes from the content script's report. Promise-wrapped because
+    // the store treats an async resolver differently: it commits the payload
+    // first and applies flags in a second pass, so first paint is never delayed
+    // on a message round trip.
+    resolveAnchors: (candidates) => Promise.resolve(
+      Object.fromEntries(candidates
+        .map((t) => [t.id, resolutionRef.current[t.id]])
+        // An id the content script hasn't reported on yet is UNKNOWN, not
+        // unanchored — dropping it lets the store leave that thread alone
+        // instead of orphaning every thread before the first report arrives.
+        .filter(([, status]) => status !== undefined)
+        .map(([id, status]) => [id, { status }])),
+    ),
+    // No observeDom: this context has no DOM to observe. The content script's own
+    // MutationObserver drives re-resolution, and its report calls onDomChanged().
+    refetch: (url) => refetchRef.current?.(url),
+  }), []);
+
+  useEffect(() => {
+    domChangedRef.current = store.onDomChanged;
+    const unsubscribe = store.subscribe(setThreads);
+    setThreads(store.getThreads());
+    return () => { unsubscribe(); domChangedRef.current = null; };
+  }, [store]);
+
+  useEffect(() => () => store.destroy(), [store]);
 
   // ── Theme ────────────────────────────────────────────────────────────────
   // Guard the persist write so it doesn't fire with the default 'light' before
@@ -368,17 +401,18 @@ function App() {
   // keeping the current view (and any unsent draft) mounted.
   const fetchThreads = useCallback(async (url, { silent = false, background = false } = {}) => {
     if (!url) return;
-    const seqAtStart = mutationSeqRef.current;
+    // Dating the request: the store drops the response if anything bumped its
+    // sequence while this was in flight (a local optimistic edit, or an accepted
+    // stream frame), so a pre-mutation snapshot can never land on top of newer
+    // state. It also drops a response whose scope is no longer the active page.
+    const token = store.beginFetch();
     if (!silent) { setLoading(true); setError(null); }
     try {
       const data = await sw('cc:api:fetchThreads', { pageUrl: url, background });
-      // Ignore a response that lost its race: the active page changed while in
-      // flight (a later fetch owns the UI now), or a local mutation landed
-      // (don't clobber the optimistic state with a pre-mutation snapshot).
-      if (url !== pageUrlRef.current || mutationSeqRef.current !== seqAtStart) return;
       const list = data?.threads ?? data ?? [];
+      const applied = store.applyFetched(Array.isArray(list) ? list : [], token, { scope: url });
+      if (!applied) return;
       threadsUrlRef.current = url;
-      setThreads(Array.isArray(list) ? list : []);
       setSessionExpired(false); // any successful fetch means the session is healthy again
       if (!silent) refreshAuth(); // sync auth only on user-initiated fetches (not every 10s poll)
     } catch (err) {
@@ -393,18 +427,29 @@ function App() {
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [refreshAuth]);
+  }, [refreshAuth, store]);
+
+  // Keep the store's catch-up re-fetch pointing at the live fetchThreads without
+  // making the store (or the SSE effect) depend on it — recreating either would
+  // tear down and reopen the stream on every render.
+  useEffect(() => {
+    refetchRef.current = (url) => fetchThreads(url, { silent: true, background: true });
+    return () => { refetchRef.current = null; };
+  }, [fetchThreads]);
 
   // Drop the previous page's threads the instant the URL changes (tab switch to
   // a different page, or same-tab SPA navigation), so stale threads aren't shown
   // in the list — or pushed onto the new page as stray markers — before the new
   // fetch resolves. Keyed on pageUrl, not tabId: threads are per-URL on the
   // server, so switching between two tabs on the *same* URL must NOT clear (and
-  // wouldn't refetch, since the fetch effect is also keyed on pageUrl).
+  // wouldn't refetch, since the fetch effect is also keyed on pageUrl). The store
+  // enforces the same-scope no-op, so two tabs on one URL cost nothing.
   useEffect(() => {
     pageUrlRef.current = pageUrl;
-    setThreads([]); setResolution({});
-  }, [pageUrl]);
+    store.setScope(pageUrl);
+    resolutionRef.current = {};
+    setResolution({});
+  }, [pageUrl, store]);
 
   // Re-fetch when URL changes or sign-in state changes (so threads load immediately after sign-in)
   useEffect(() => { if (pageUrl && auth.signedIn) fetchThreads(pageUrl); }, [pageUrl, auth.signedIn, fetchThreads]);
@@ -425,60 +470,18 @@ function App() {
   //     cookie branch only applies when no Authorization header is present).
   //     No server change, and no third-party-cookie dependency.
   //
-  // Stream frames need the same protection poll responses get: a frame is just
-  // as capable of clobbering optimistic local state. The sequence-number trick
-  // fetchThreads uses doesn't transfer — a pushed frame has no "request start"
-  // to compare against — so frames are suppressed for a short window after a
-  // local mutation instead. See lastMutationAtRef.
-  //
-  // A suppressed frame must be RE-FETCHED, not merely dropped. The backend
-  // broadcasts only on write, and no poll is running while the stream is healthy
-  // (the realtime ladder stops it on the first frame), so a discarded frame is
-  // gone for good: if another reviewer's change happens to land inside the
-  // window, this panel would never see it for the rest of the session. The timer
-  // below re-syncs once the window closes, which restores eventual consistency.
-  const catchUpTimerRef = useRef(null);
+  // Stream frames get the same protection poll responses do — a frame is just as
+  // capable of clobbering optimistic local state — and the store owns that rule
+  // now: suppress for a grace window after a local mutation, then RE-FETCH rather
+  // than dropping (the backend broadcasts only on write and no poll runs while
+  // the stream is healthy, so a discarded frame is gone for the session).
   const applyStreamThreads = useCallback((payload, forUrl) => {
-    if (forUrl !== pageUrlRef.current) return; // page changed under us
-
-    const sinceMutation = Date.now() - lastMutationAtRef.current;
-    if (sinceMutation < MUTATION_GRACE_MS) {
-      // One pending catch-up is enough — collapse repeats rather than stacking
-      // a timer per suppressed frame.
-      if (catchUpTimerRef.current === null) {
-        catchUpTimerRef.current = setTimeout(() => {
-          catchUpTimerRef.current = null;
-          if (forUrl === pageUrlRef.current) {
-            catchUpRef.current?.(forUrl);
-          }
-        }, MUTATION_GRACE_MS - sinceMutation + 50);
-      }
-      return;
-    }
-
     const list = payload?.threads ?? payload ?? [];
     if (!Array.isArray(list)) return;
-    // Bump the sequence so an in-flight poll started BEFORE this frame can't
-    // land afterwards and revert it (fetchThreads compares against this).
-    mutationSeqRef.current += 1;
+    if (!store.applyPushed(list, { scope: forUrl })) return;
     threadsUrlRef.current = forUrl;
-    setThreads(list);
     setSessionExpired(false); // a live frame proves the session is healthy
-  }, []);
-
-  // Indirection so applyStreamThreads (deps []) can reach the current
-  // fetchThreads without being recreated — recreating it would tear down and
-  // reopen the SSE stream on every render.
-  const catchUpRef = useRef(null);
-
-  // Keep the catch-up indirection pointing at the live fetchThreads.
-  useEffect(() => {
-    catchUpRef.current = (url) => fetchThreads(url, { silent: true, background: true });
-  }, [fetchThreads]);
-
-  useEffect(() => () => {
-    if (catchUpTimerRef.current !== null) clearTimeout(catchUpTimerRef.current);
-  }, []);
+  }, [store]);
 
   useEffect(() => {
     if (!pageUrl || !auth.signedIn) return undefined;
@@ -575,7 +578,15 @@ function App() {
           handleNewThreadRef.current?.(p.pageUrl, p.anchor, p.body);
         }
         if (p.type === 'cc:panel:resolutionUpdated') {
-          setResolution(p.resolution ?? {});
+          const next = p.resolution ?? {};
+          setResolution(next);
+          // The content script re-resolves on its own MutationObserver, so its
+          // report IS this context's "the DOM changed" signal. Feeding it to the
+          // store is what gives this panel the orphan lifecycle it never had:
+          // an anchor that stops resolving gets marked, and — the half that was
+          // missing — one that comes back gets un-marked.
+          resolutionRef.current = next;
+          domChangedRef.current?.();
         }
         if (p.type === 'cc:panel:modeCancelled') {
           setModeState(null);
@@ -677,7 +688,10 @@ function App() {
   async function signOut() {
     await sw('cc:auth:signOut');
     setAuth({ signedIn: false, profile: null });
-    setThreads([]);
+    // Clear through the store, not setThreads: it owns the list, so a bare
+    // setThreads would be overwritten by the store's next emit — and would leave
+    // the store still holding a signed-out user's threads.
+    store.applyFetched([]);
   }
 
   function exportJson() {
@@ -802,15 +816,11 @@ function App() {
               pageUrl={pageUrl}
               auth={auth}
               onBack={() => { setView('list'); setActiveId(null); }}
-              onUpdate={(updated) => {
-                // Optimistic mutation — mark it so an older in-flight poll can't
-                // revert it (see fetchThreads' mutationSeq guard).
-                noteLocalMutation();
-                setThreads(ts => ts.map(t => t.id === updated.id ? updated : t));
-              }}
+              // Optimistic mutations. The store marks each one so neither an
+              // older in-flight poll nor an incoming stream frame can revert it.
+              onUpdate={(updated) => { store.upsertThread(updated); }}
               onDelete={() => {
-                noteLocalMutation();
-                setThreads(ts => ts.filter(t => t.id !== activeId));
+                store.removeThread(activeId);
                 setView('list'); setActiveId(null);
               }}
               onScrollTo={() => {

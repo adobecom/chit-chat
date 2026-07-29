@@ -305,17 +305,16 @@ if (window.__chitChatLoaded) {
   function renderMarkers() {
     const overlay = ensureOverlay();
     overlay.innerHTML = '';
-    // hideOrphaned:false — this client can't CLEAR is_orphaned. milo sets the
-    // flag server-side and un-sets it from its own MutationObserver; without
-    // that half, hiding orphaned threads here would drop their markers
-    // permanently while the panel list still showed them. Render them instead
-    // and let resolveMarkerPlacement report 'unanchored', which the stylesheet
-    // already dims to 25% grayscale — an honest "this no longer resolves"
-    // signal rather than a silent disappearance.
-    const markers = buildOverlayModel(_threads, {
-      statusFilter: _statusFilter,
-      hideOrphaned: false,
-    });
+    // hideOrphaned is back to the DEFAULT (true), matching milo. It was forced to
+    // false because this extension could only ever SET is_orphaned, never clear
+    // it — so hiding an orphaned thread's marker would have hidden it forever,
+    // with the panel list still showing the thread and no way to explain the
+    // disagreement. Now the panel drives BOTH halves of the lifecycle through
+    // @adobe/annotations-core/thread-store: this script's resolution report is
+    // what tells the store an anchor came back, and the store PATCHes
+    // is_orphaned:false. With recovery in place, hiding is safe and correct —
+    // an orphaned marker sits at a stale stored position pointing at nothing.
+    const markers = buildOverlayModel(_threads, { statusFilter: _statusFilter });
     for (const marker of markers) {
       if (marker.kind === 'shape') {
         renderShapeMarker(overlay, marker.thread);
