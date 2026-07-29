@@ -8,11 +8,47 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm run build       # one-shot production build (minified)
 npm run watch       # development watch mode (unminified, rebuilds on change)
 npm run icons       # regenerate icon PNGs
+npm test            # vitest + jsdom (pure helpers from sidepanel.jsx)
 ```
 
-There is no test runner or linter configured.
+No linter is configured.
 
 After building, reload the unpacked extension at `chrome://extensions` to pick up changes.
+
+### Tests
+
+`vitest run`, jsdom environment, specs in `test/`. Scope is deliberately narrow —
+the **pure helpers** exported from `src/sidepanel.jsx` (mention highlighting,
+`findMentionQuery`, identity/status helpers) plus the points where they sit on top
+of `@adobe/annotations-core`. Two constraints shape this:
+
+- The S2 component tree is **not** rendered in tests. `sidepanel.jsx` imports
+  `@react-spectrum/s2` and its CSS, which only resolve through `build.mjs`'s
+  esbuild loaders; `vitest.config.js` inlines S2/Quill and sets `css: false` so
+  the module can at least be *imported*.
+- Importing `sidepanel.jsx` runs its module-scope
+  `createRoot(...).render(<App/>)` bootstrap. `test/setup.js` provides a `#root`
+  container and a no-op `chrome.*` stub so that mounts harmlessly instead of
+  throwing. Don't restructure the bootstrap purely for tests.
+
+Helpers must be `export`ed to be testable (nothing in `src/` was exported before
+this suite existed).
+
+### Testing a change to @adobe/annotations-core
+
+This extension consumes the **published** package, so a core change is invisible
+here until it ships. To build against an unpublished core, run from a
+`milo-logs-deploy` checkout:
+
+```bash
+scripts/link-annotations-core.sh              # symlinks its working-tree core in
+npm run build                                  # …then reload the extension
+scripts/link-annotations-core.sh --unlink     # restore the published tarball
+```
+
+Always `--unlink` before committing: the link only touches `node_modules`, but
+`dist/` is committed here, so a build made against a linked core would ship
+unpublished code.
 
 ## Architecture
 
@@ -37,8 +73,8 @@ Central message router and API proxy. Key responsibilities:
 
 Runs in the `MAIN` world so it has live DOM access. Key responsibilities:
 - **Annotation modes**: element-picker (click-to-comment), rect-draw, ellipse-draw, text-selection "+Comment" button
-- **Anchor capture**: `captureAnchor()` records CSS selector, XPath, text content, bounding rect, tag, alt, src
-- **Anchor resolution**: `resolveAnchor()` cascade — CSS selector → XPath → fuzzy Levenshtein text match
+- **Anchor capture**: `captureAnchor()` (from `@adobe/annotations-core/anchor`) records CSS selector, XPath, text content, bounding rect, tag, alt, src
+- **Anchor resolution**: `resolveAnchor()` (same package) cascade — CSS selector → XPath → fuzzy Levenshtein text match
 - **Overlay markers**: dot markers pinned over resolved elements; shape markers (rect/ellipse) for region annotations
 - **SPA navigation**: patches `history.pushState/replaceState` and listens to `popstate`/`hashchange`; debounced `MutationObserver` re-resolves orphaned anchors after DOM mutations
 
@@ -79,4 +115,4 @@ S2's `style()` macro (`@react-spectrum/s2/style` with `{ type: 'macro' }`) is av
 - `CLIENT_ID = 'milo-logs-claude-mcp'`
 - `SCOPES = 'AdobeID,openid,profile,email'`
 - Extension ID: `nafgnogpgkcheonjkjjdfjjhnhllbkdh` (pinned by manifest `key`)
-- Annotation anchor format is compatible with the original Milo page-commenter bookmarklet
+- Anchor capture/resolution, HTML sanitization, and the `/annotations` endpoint contract come from `@adobe/annotations-core` (an npm dependency whose source of truth is `milo-logs-deploy`'s `packages/annotations-core`), shared with the milo-logs-deploy page-commenter bundle — not hand-kept-in-sync, so anchor format compatibility is structural rather than a convention to maintain
