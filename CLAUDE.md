@@ -71,7 +71,10 @@ Central message router and API proxy. Key responsibilities:
 
 ### content.js — Page Overlay
 
-Runs in the `MAIN` world so it has live DOM access. Key responsibilities:
+Runs in the ISOLATED world (Chrome's default for content scripts, so `chrome.runtime`
+messaging works — see `content.js`'s own header). It still has live host-DOM
+access; what ISOLATED withholds is the page's JS heap, which this script never
+needs. Key responsibilities:
 - **Annotation modes**: element-picker (click-to-comment), rect-draw, ellipse-draw, text-selection "+Comment" button
 - **Anchor capture**: `captureAnchor()` (from `@adobe/annotations-core/anchor`) records CSS selector, XPath, text content, bounding rect, tag, alt, src
 - **Anchor resolution**: `resolveAnchor()` (same package) cascade — CSS selector → XPath → fuzzy Levenshtein text match

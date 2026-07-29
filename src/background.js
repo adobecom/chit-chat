@@ -257,6 +257,25 @@ async function apiRequest(path, opts = {}, retry = true, { interactive = true } 
  *   cc:panel:*      — forward to the side panel (via content→SW→panel routing)
  */
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Only our own extension's contexts may drive this channel.
+  //
+  // `sender` was accepted and never read, which is safe ONLY as long as no web
+  // page can reach us — and today none can, since the manifest declares no
+  // `externally_connectable`. But `cc:auth:streamToken` below returns a raw IMS
+  // bearer token that previously never left the service worker, so the moment
+  // anyone adds that key this becomes a token-exfiltration primitive. Two lines
+  // now beats a security review later that has to spot the connection.
+  if (sender.id !== chrome.runtime.id) {
+    sendResponse({ ok: false, error: 'forbidden sender' });
+    return false;
+  }
+  // A message carrying `sender.tab` came from a CONTENT SCRIPT — our own code, but
+  // running inside the host page and therefore the least trusted of our contexts.
+  // It has no reason to hold the bearer token; only the panel needs it, for SSE.
+  if (msg?.type === 'cc:auth:streamToken' && sender.tab) {
+    sendResponse({ ok: false, error: 'forbidden sender' });
+    return false;
+  }
   handleMessage(msg, sender)
     .then((result) => sendResponse({ ok: true, result }))
     // Coerce defensively: if a non-Error is ever thrown, `err.message` would

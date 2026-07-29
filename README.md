@@ -77,7 +77,7 @@ background.js (service worker)
   ├─ proxies all /annotations API calls (host_permissions → no CORS)
   └─ brokers messages between content ↔ side panel
 
-content.js (injected into host page, MAIN world)
+content.js (injected into host page, ISOLATED world — Chrome's default)
   ├─ overlay: dot markers, shape markers
   ├─ element-picker, shape-draw, text-selection modes
   ├─ anchor capture + resolution cascade
