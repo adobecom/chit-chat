@@ -87,6 +87,28 @@ const configs = [
     loader: { '.jsx': 'jsx' },
     jsx: 'automatic',
     jsxImportSource: 'react',
+    // Pin react/react-dom to THIS package's copy.
+    //
+    // @adobe/annotations-core declares them as peerDependencies, but its own
+    // devDependencies (@testing-library/react, for its vitest suite) install a
+    // second copy under packages/annotations-core/node_modules/. That copy is
+    // invisible when the core is installed as a published tarball, and very
+    // visible when it is SYMLINKED for local development via
+    // scripts/link-annotations-core.sh — esbuild then resolves the core's `react`
+    // import from the nested copy and bundles BOTH.
+    //
+    // The failure is not subtle but it is easy to misattribute: two Reacts share
+    // one component tree, so a component imported from the core (QuillEditor)
+    // renders against a null dispatcher and throws "Cannot read properties of
+    // null (reading 'useRef')" the moment a thread detail view mounts — with no
+    // mention of React or the core in the message. milo's gulpfile.mjs has
+    // carried this same alias for the same reason; this build had no equivalent,
+    // so every LINKED build was broken while the published one worked, which is
+    // the worst possible split for a pre-publish verification step.
+    alias: {
+      react: 'react',
+      'react-dom': 'react-dom',
+    },
     plugins: [macroPlugin, localePlugin],
     // S2's vendored TableView.css ships an empty `:has()` selector that esbuild
     // flags as a CSS syntax error (still present as of S2 1.5.1). It's in a

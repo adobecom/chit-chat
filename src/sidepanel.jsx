@@ -7,7 +7,8 @@
  *
  * State model:
  *   pageUrl    — current active tab's page URL (updated by content script messages)
- *   threads    — fetched from the backend, re-fetched on URL change + every 10s
+ *   threads    — from the backend: an SSE stream (see the realtime effect), with a
+ *                10s poll as the fallback when the stream cannot be held
  *   resolution — { [threadId]: 'resolved'|'approximate'|'unanchored' } from content script
  *   view       — 'list' | 'detail'
  *   activeId   — focused thread id (detail view)
@@ -41,8 +42,22 @@ import {
   Tag,
   Avatar,
 } from '@react-spectrum/s2';
-import { sanitizeHtml, stripHtml } from './sanitize.js';
-import QuillEditor from './QuillEditor.jsx';
+import { sanitizeHtml, stripHtml } from '@adobe/annotations-core/sanitize';
+import { STATUS_BADGE_VARIANT } from '@adobe/annotations-core/colors';
+import { eventsPath } from '@adobe/annotations-core/contract';
+import { createRealtimeConnection, pumpSseStream } from '@adobe/annotations-core/realtime';
+import { createThreadStore } from '@adobe/annotations-core/thread-store';
+import {
+  MENTION_SEARCH_DEBOUNCE_MS, createMentionPicker, findMentionQuery,
+} from '@adobe/annotations-core/mentions';
+import QuillEditor from '@adobe/annotations-core/QuillEditor';
+// Quill itself (and its CSS) is bundled here, not lazy-loaded, since the side
+// panel's CSP is script-src 'self' — nothing can load from a CDN. Passed to
+// the shared QuillEditor via loadQuill; milo-logs-deploy's client instead
+// passes its own CDN-lazy loader (see QuillEditor.jsx's header comment for why).
+import Quill from 'quill';
+import 'quill/dist/quill.snow.css';
+import EmojiIcon from '@react-spectrum/s2/icons/Emoji';
 import BrightnessContrastIcon from '@react-spectrum/s2/icons/BrightnessContrast';
 import ChevronLeftIcon from '@react-spectrum/s2/icons/ChevronLeft';
 import CircleIcon from '@react-spectrum/s2/icons/Circle';
@@ -56,9 +71,21 @@ import TargetIcon from '@react-spectrum/s2/icons/Target';
 import ThumbDownIcon from '@react-spectrum/s2/icons/ThumbDown';
 import ThumbUpIcon from '@react-spectrum/s2/icons/ThumbUp';
 
+// Quill is already loaded (static import above) — the shared QuillEditor's
+// loadQuill prop exists so milo-logs-deploy's client can lazy-load from a CDN
+// instead; here it just resolves immediately. Defined once at module scope
+// (not per-render) since it's passed to every QuillEditor instance.
+const loadQuill = () => Promise.resolve(Quill);
+const renderEmojiIcon = () => <EmojiIcon aria-hidden UNSAFE_className="cc-emoji-icon" />;
+
 // Caps a comment body defensively — base64 screenshots can bloat it into the
 // MBs, and neither the API proxy nor the backend's body-column limit is guarded.
 const MAX_COMMENT_BODY_CHARS = 2_000_000; // ~2MB
+// The optimistic-mutation grace window that used to live here is now
+// DEFAULT_MUTATION_GRACE_MS in @adobe/annotations-core/thread-store, shared with
+// milo's in-page client (same 1500ms). Do not reintroduce a local copy — the
+// store applies it, so a second constant here would drift silently.
+
 const BODY_TOO_LARGE_MSG = "That comment is too large to post — try a smaller or cropped screenshot.";
 
 // ── Send to service worker ────────────────────────────────────────────────────
@@ -76,7 +103,7 @@ async function toContent(tabId, type, payload = {}) {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-function relTime(iso) {
+export function relTime(iso) {
   const diff = (Date.now() - new Date(iso)) / 1000;
   if (diff < 60) return 'just now';
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
@@ -86,7 +113,7 @@ function relTime(iso) {
 
 // Absolute date-time string, e.g. "Jul 10, 12:45 AM". Used inside a thread
 // (comments) where the precise time matters; the list keeps the terse relTime.
-function fmtDate(iso) {
+export function fmtDate(iso) {
   if (!iso) return '';
   return new Date(iso).toLocaleString(undefined, {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -96,7 +123,7 @@ function fmtDate(iso) {
 // Two-letter initials from a profile: first + last name initial
 // (e.g. John Doe → "JD"). Prefers structured given/family name parts, then
 // falls back to splitting the display name, then the email local part.
-function initials(profile) {
+export function initials(profile) {
   const first = profile?.first?.trim();
   const last = profile?.last?.trim();
   if (first && last) return (first[0] + last[0]).toUpperCase();
@@ -135,8 +162,8 @@ async function setMyVote(commentId, v) {
 // string/regex pass over the markup could match inside attribute values.
 // Walking text nodes via DOMParser (no browsing context, so no embedded
 // resource ever loads/fires here) keeps the rewrite scoped to visible text.
-function highlightMentionsHtml(html, mentions) {
-  const names = [...new Set((mentions ?? []).map((m) => m.name).filter(Boolean))]
+export function highlightMentionsHtml(html, mentions) {
+  const names = [...new Set((mentions ?? []).map((m) => m.name?.trim()).filter(Boolean))]
     // Longest names first, so "@Alice Reza" isn't cut short by "@Alice" from another mention.
     .sort((a, b) => b.length - a.length)
     .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
@@ -173,23 +200,23 @@ function highlightMentionsHtml(html, mentions) {
 }
 
 // Human-readable status label. Undefined/null is treated as 'open'.
-function statusLabel(status) {
+export function statusLabel(status) {
   if (status === 'in_progress') return 'In progress';
   if (status === 'resolved') return 'Resolved';
   return 'Open';
 }
 
 // S2 Badge variant per status — colored text/pill with theme-safe contrast
-// in both light and dark (S2 owns the fg/bg pairing).
-function statusBadgeVariant(status) {
-  if (status === 'in_progress') return 'informative';
-  if (status === 'resolved') return 'positive';
-  return 'notice'; // 'open' or undefined
+// in both light and dark (S2 owns the fg/bg pairing). Shared with
+// milo-logs-deploy's ThreadCard.js, which independently landed on this same
+// mapping — single source of truth now instead of two maps that happen to agree.
+export function statusBadgeVariant(status) {
+  return STATUS_BADGE_VARIANT[status] ?? STATUS_BADGE_VARIANT.open; // 'open' or undefined
 }
 
 // The author_name we stamp on comments this user creates — single source of
 // truth shared by comment creation and the ownership guard below.
-function myAuthorName(profile) {
+export function myAuthorName(profile) {
   return profile?.name ?? profile?.email ?? null;
 }
 
@@ -199,7 +226,7 @@ function myAuthorName(profile) {
 // comments that aren't the current user's. Limitations: identical display names
 // collide, and a changed profile name orphans a user from their old comments.
 // This is a courtesy guard, not a security boundary.
-function isMyComment(comment, profile) {
+export function isMyComment(comment, profile) {
   const me = myAuthorName(profile);
   return !!me && comment?.author_name === me;
 }
@@ -222,7 +249,6 @@ function App() {
   const [error, setError] = useState(null);
   const [sessionExpired, setSessionExpired] = useState(false);
   const [avatarFailed, setAvatarFailed] = useState(false);
-  const pollRef = useRef(null);
   // The message listener is registered once (stable), but handleNewThread closes
   // over auth/state that change across renders. Route through a ref so the
   // listener always calls the latest closure instead of the first render's
@@ -235,10 +261,58 @@ function App() {
   // push effect can read current values without extra deps.
   const pageUrlRef = useRef('');
   const threadsUrlRef = useRef(null);
-  // Bumped on every optimistic local mutation (reply/edit/delete/vote/status).
-  // A fetch that started before a bump is dropped on arrival so an older
-  // in-flight poll can't clobber the optimistic state.
-  const mutationSeqRef = useRef(0);
+
+  // ── The shared thread store ──────────────────────────────────────────────
+  // Everything about WHICH update is allowed to land — the mutation sequence for
+  // in-flight fetches, the grace window for pushed stream frames, the catch-up
+  // re-fetch, and the whole orphan lifecycle — now lives in
+  // @adobe/annotations-core/thread-store, shared with milo's in-page client.
+  //
+  // The staleness guards came FROM here (milo had none, which was a live bug
+  // there). What this panel GAINS in return is the orphan lifecycle: it can now
+  // both mark a thread orphaned and, crucially, un-mark it when the anchor comes
+  // back — the recovery half it never had, and the reason content.js had to pass
+  // buildOverlayModel's `hideOrphaned: false` escape hatch.
+  //
+  // resolveAnchors is ASYNC here and not in milo, for a structural reason: the
+  // anchors live in the HOST PAGE, and this code runs in the side panel, which
+  // has no page access at all. The content script owns resolution and reports it
+  // by message (cc:panel:resolutionUpdated); the resolver below answers from that
+  // latest report rather than resolving anything itself.
+  const resolutionRef = useRef({});
+  // Set once the store exists, so the message handler can nudge it (the handler
+  // is registered in a stable effect and must not depend on the store).
+  const domChangedRef = useRef(null);
+  const refetchRef = useRef(null);
+
+  const store = useMemo(() => createThreadStore({
+    patchThread: (id, patch) => sw('cc:api:patchThread', { id, data: patch }),
+    // Resolution comes from the content script's report. Promise-wrapped because
+    // the store treats an async resolver differently: it commits the payload
+    // first and applies flags in a second pass, so first paint is never delayed
+    // on a message round trip.
+    resolveAnchors: (candidates) => Promise.resolve(
+      Object.fromEntries(candidates
+        .map((t) => [t.id, resolutionRef.current[t.id]])
+        // An id the content script hasn't reported on yet is UNKNOWN, not
+        // unanchored — dropping it lets the store leave that thread alone
+        // instead of orphaning every thread before the first report arrives.
+        .filter(([, status]) => status !== undefined)
+        .map(([id, status]) => [id, { status }])),
+    ),
+    // No observeDom: this context has no DOM to observe. The content script's own
+    // MutationObserver drives re-resolution, and its report calls onDomChanged().
+    refetch: (url) => refetchRef.current?.(url),
+  }), []);
+
+  useEffect(() => {
+    domChangedRef.current = store.onDomChanged;
+    const unsubscribe = store.subscribe(setThreads);
+    setThreads(store.getThreads());
+    return () => { unsubscribe(); domChangedRef.current = null; };
+  }, [store]);
+
+  useEffect(() => () => store.destroy(), [store]);
 
   // ── Theme ────────────────────────────────────────────────────────────────
   // Guard the persist write so it doesn't fire with the default 'light' before
@@ -337,17 +411,18 @@ function App() {
   // keeping the current view (and any unsent draft) mounted.
   const fetchThreads = useCallback(async (url, { silent = false, background = false } = {}) => {
     if (!url) return;
-    const seqAtStart = mutationSeqRef.current;
+    // Dating the request: the store drops the response if anything bumped its
+    // sequence while this was in flight (a local optimistic edit, or an accepted
+    // stream frame), so a pre-mutation snapshot can never land on top of newer
+    // state. It also drops a response whose scope is no longer the active page.
+    const token = store.beginFetch();
     if (!silent) { setLoading(true); setError(null); }
     try {
       const data = await sw('cc:api:fetchThreads', { pageUrl: url, background });
-      // Ignore a response that lost its race: the active page changed while in
-      // flight (a later fetch owns the UI now), or a local mutation landed
-      // (don't clobber the optimistic state with a pre-mutation snapshot).
-      if (url !== pageUrlRef.current || mutationSeqRef.current !== seqAtStart) return;
       const list = data?.threads ?? data ?? [];
+      const applied = store.applyFetched(Array.isArray(list) ? list : [], token, { scope: url });
+      if (!applied) return;
       threadsUrlRef.current = url;
-      setThreads(Array.isArray(list) ? list : []);
       setSessionExpired(false); // any successful fetch means the session is healthy again
       if (!silent) refreshAuth(); // sync auth only on user-initiated fetches (not every 10s poll)
     } catch (err) {
@@ -362,35 +437,125 @@ function App() {
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [refreshAuth]);
+  }, [refreshAuth, store]);
+
+  // Keep the store's catch-up re-fetch pointing at the live fetchThreads without
+  // making the store (or the SSE effect) depend on it — recreating either would
+  // tear down and reopen the stream on every render.
+  useEffect(() => {
+    refetchRef.current = (url) => fetchThreads(url, { silent: true, background: true });
+    return () => { refetchRef.current = null; };
+  }, [fetchThreads]);
 
   // Drop the previous page's threads the instant the URL changes (tab switch to
   // a different page, or same-tab SPA navigation), so stale threads aren't shown
   // in the list — or pushed onto the new page as stray markers — before the new
   // fetch resolves. Keyed on pageUrl, not tabId: threads are per-URL on the
   // server, so switching between two tabs on the *same* URL must NOT clear (and
-  // wouldn't refetch, since the fetch effect is also keyed on pageUrl).
+  // wouldn't refetch, since the fetch effect is also keyed on pageUrl). The store
+  // enforces the same-scope no-op, so two tabs on one URL cost nothing.
   useEffect(() => {
     pageUrlRef.current = pageUrl;
-    setThreads([]); setResolution({});
-  }, [pageUrl]);
+    store.setScope(pageUrl);
+    resolutionRef.current = {};
+    setResolution({});
+  }, [pageUrl, store]);
 
   // Re-fetch when URL changes or sign-in state changes (so threads load immediately after sign-in)
   useEffect(() => { if (pageUrl && auth.signedIn) fetchThreads(pageUrl); }, [pageUrl, auth.signedIn, fetchThreads]);
 
-  // Poll every 10s (pause when doc hidden or signed out); silent so no spinner flash.
-  // Also refresh immediately when the panel becomes visible again, so returning
-  // to it doesn't show up-to-10s-stale threads.
+  // ── Realtime: SSE stream, falling back to polling ─────────────────────────
+  // Previously a fixed 10s poll, which meant the extension was always up to 10s
+  // stale even though the backend pushes instantly in production. The
+  // connect/retry/fall-back-to-poll ladder is shared with milo's in-page client
+  // via @adobe/annotations-core/realtime; only how the connection is opened
+  // differs, and it has to:
+  //
+  //   - milo uses a native EventSource authenticated by the pc_session cookie
+  //     (EventSource cannot send an Authorization header).
+  //   - the panel is a chrome-extension:// origin, so that cookie would be
+  //     third-party and subject to blocking. Instead it reads the stream with
+  //     fetch + ReadableStream and the SAME Bearer token every other request
+  //     uses — the backend accepts a Bearer on GET /annotations/events (its
+  //     cookie branch only applies when no Authorization header is present).
+  //     No server change, and no third-party-cookie dependency.
+  //
+  // Stream frames get the same protection poll responses do — a frame is just as
+  // capable of clobbering optimistic local state — and the store owns that rule
+  // now: suppress for a grace window after a local mutation, then RE-FETCH rather
+  // than dropping (the backend broadcasts only on write and no poll runs while
+  // the stream is healthy, so a discarded frame is gone for the session).
+  const applyStreamThreads = useCallback((payload, forUrl) => {
+    const list = payload?.threads ?? payload ?? [];
+    if (!Array.isArray(list)) return;
+    if (!store.applyPushed(list, { scope: forUrl })) return;
+    threadsUrlRef.current = forUrl;
+    setSessionExpired(false); // a live frame proves the session is healthy
+  }, [store]);
+
   useEffect(() => {
-    if (!pageUrl || !auth.signedIn) return;
-    const refresh = () => { if (!document.hidden) fetchThreads(pageUrl, { silent: true, background: true }); };
-    pollRef.current = setInterval(refresh, 10_000);
-    document.addEventListener('visibilitychange', refresh);
+    if (!pageUrl || !auth.signedIn) return undefined;
+
+    const urlAtStart = pageUrl;
+    const conn = createRealtimeConnection({
+      // Keep the existing SW-proxied fetch as the fallback: it already handles
+      // token refresh, SESSION_EXPIRED and the 401 retry. Skipped while the
+      // panel is hidden — a background poll for a panel nobody is looking at is
+      // pure API load (the pre-SSE poll had this same guard).
+      poll: () => {
+        if (document.hidden) return undefined;
+        return fetchThreads(urlAtStart, { silent: true, background: true });
+      },
+      onThreads: (payload) => applyStreamThreads(payload, urlAtStart),
+      pollMs: 10_000, // unchanged from the previous fixed poll
+      openStream: async ({ onMessage, onError, signal }) => {
+        const controller = new AbortController();
+        // Link the ladder's signal to our controller. This is what makes an
+        // in-flight connect cancellable: until `fetch` resolves there is no
+        // teardown function for conn.stop() to call, so without this a request
+        // that never returns headers (hung pod, buffering proxy) holds its socket
+        // for the life of the panel — one more on every reconnect.
+        if (signal) {
+          if (signal.aborted) controller.abort();
+          else signal.addEventListener('abort', () => controller.abort(), { once: true });
+        }
+
+        const { token, apiBase, clientId } = await sw('cc:auth:streamToken');
+        // No token → let the ladder degrade to polling rather than opening an
+        // unauthenticated stream that would 401 immediately.
+        if (!token) throw new Error('no token for stream');
+        // The token round trip is itself awaited, so re-check before opening.
+        if (controller.signal.aborted) throw new Error('aborted before connect');
+
+        const url = `${apiBase}${eventsPath(urlAtStart)}&clientId=${clientId}`;
+        const res = await fetch(url, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
+          signal: controller.signal,
+        });
+        if (!res.ok || !res.body) throw new Error(`stream failed: ${res.status}`);
+
+        // Pump in the background; a normal end-of-stream is also a failure from
+        // the ladder's perspective (the server closed), so both paths call
+        // onError and let it decide whether to retry or degrade.
+        pumpSseStream(res.body, onMessage, { signal: controller.signal })
+          .then(() => { if (!controller.signal.aborted) onError(new Error('stream ended')); })
+          .catch((err) => { if (!controller.signal.aborted) onError(err); });
+
+        return () => controller.abort();
+      },
+    });
+
+    conn.start();
+    // Returning to the panel reconnects a dead stream / polls immediately, so
+    // it never shows stale threads after being hidden.
+    const onVisible = () => { if (!document.hidden) conn.refreshNow(); };
+    document.addEventListener('visibilitychange', onVisible);
+
     return () => {
-      clearInterval(pollRef.current);
-      document.removeEventListener('visibilitychange', refresh);
+      document.removeEventListener('visibilitychange', onVisible);
+      conn.stop();
     };
-  }, [pageUrl, auth.signedIn, fetchThreads]);
+  }, [pageUrl, auth.signedIn, fetchThreads, applyStreamThreads]);
 
   // ── Push threads to content script overlay ────────────────────────────────
   // Only push when the current threads actually belong to the active page. On a
@@ -398,11 +563,14 @@ function App() {
   // but the previous page's threads still in state; pushing then would flash the
   // old page's markers on the new tab. threadsUrlRef is set in fetchThreads to
   // the URL the threads were fetched for.
+  // statusFilter rides along so the on-page overlay hides the same threads the
+  // list does (the shared overlay model applies it) — before this the overlay
+  // rendered every thread regardless of the filter, including orphaned ones.
   useEffect(() => {
     if (tabId !== null && threadsUrlRef.current === pageUrl) {
-      toContent(tabId, 'cc:content:threads', { threads }).catch(() => {});
+      toContent(tabId, 'cc:content:threads', { threads, statusFilter }).catch(() => {});
     }
-  }, [threads, tabId, pageUrl]);
+  }, [threads, tabId, pageUrl, statusFilter]);
 
   // ── Incoming messages from content script (via SW broadcast) ─────────────
   useEffect(() => {
@@ -420,7 +588,15 @@ function App() {
           handleNewThreadRef.current?.(p.pageUrl, p.anchor, p.body);
         }
         if (p.type === 'cc:panel:resolutionUpdated') {
-          setResolution(p.resolution ?? {});
+          const next = p.resolution ?? {};
+          setResolution(next);
+          // The content script re-resolves on its own MutationObserver, so its
+          // report IS this context's "the DOM changed" signal. Feeding it to the
+          // store is what gives this panel the orphan lifecycle it never had:
+          // an anchor that stops resolving gets marked, and — the half that was
+          // missing — one that comes back gets un-marked.
+          resolutionRef.current = next;
+          domChangedRef.current?.();
         }
         if (p.type === 'cc:panel:modeCancelled') {
           setModeState(null);
@@ -522,7 +698,10 @@ function App() {
   async function signOut() {
     await sw('cc:auth:signOut');
     setAuth({ signedIn: false, profile: null });
-    setThreads([]);
+    // Clear through the store, not setThreads: it owns the list, so a bare
+    // setThreads would be overwritten by the store's next emit — and would leave
+    // the store still holding a signed-out user's threads.
+    store.applyFetched([]);
   }
 
   function exportJson() {
@@ -647,15 +826,11 @@ function App() {
               pageUrl={pageUrl}
               auth={auth}
               onBack={() => { setView('list'); setActiveId(null); }}
-              onUpdate={(updated) => {
-                // Optimistic mutation — mark it so an older in-flight poll can't
-                // revert it (see fetchThreads' mutationSeq guard).
-                mutationSeqRef.current += 1;
-                setThreads(ts => ts.map(t => t.id === updated.id ? updated : t));
-              }}
+              // Optimistic mutations. The store marks each one so neither an
+              // older in-flight poll nor an incoming stream frame can revert it.
+              onUpdate={(updated) => { store.upsertThread(updated); }}
               onDelete={() => {
-                mutationSeqRef.current += 1;
-                setThreads(ts => ts.filter(t => t.id !== activeId));
+                store.removeThread(activeId);
                 setView('list'); setActiveId(null);
               }}
               onScrollTo={() => {
@@ -788,111 +963,30 @@ function ThreadCard({ thread, resolution, onClick }) {
 }
 
 // ── @-mention autocomplete ───────────────────────────────────────────────────
-// "@" opens a floating suggestion list (cc:api:searchPeople). Not an atomic
-// token — a mention is just inserted "@Name " text in the Quill editor (see
-// QuillEditor.jsx) plus an email tracked alongside it in React state, not a
-// rich-text object Quill itself understands. Shared by the reply composer
-// (ThreadDetail) and edit editor (CommentItem).
+// "@" opens a floating suggestion list. Not an atomic token — a mention is just
+// inserted "@Name " text in the Quill editor (see QuillEditor.jsx) plus an email
+// tracked alongside it in React state, not a rich-text object Quill itself
+// understands. Shared by the reply composer (ThreadDetail) and edit editor
+// (CommentItem).
+//
+// The query detection, debounce, list navigation and insert-on-pick logic all
+// live in @adobe/annotations-core/mentions, shared with milo-logs-deploy's
+// client (which previously could RENDER mentions but not author them). Only the
+// transport is injected here: this client proxies the people search through its
+// service worker, milo calls fetch directly.
+// Re-exported so tests can exercise it through this module; the implementation
+// now lives in the shared package.
+export { findMentionQuery };
 
-const MENTION_SEARCH_DEBOUNCE_MS = 150;
+const useMentionPicker = createMentionPicker({
+  useState,
+  useEffect,
+  searchPeople: (q) => sw('cc:api:searchPeople', { q }),
+});
 
 // Matches .cc-mention-popover's CSS box (margin-top + border + max-height) —
 // used to decide whether the popover fits below the anchor or must flip above it.
 const MENTION_POPOVER_SPACE_PX = 190;
-
-// Finds the in-progress "@query" ending at `caret`. Requires whitespace/
-// start-of-string before "@" (so "foo@adobe.com" doesn't trigger it), and
-// closes on a space (multi-word names must be picked from the list).
-function findMentionQuery(text, caret) {
-  if (caret == null) return null;
-  const before = text.slice(0, caret);
-  const match = before.match(/@([^\s@]*)$/);
-  if (!match) return null;
-  const start = match.index;
-  if (start > 0 && !/\s/.test(before[start - 1])) return null;
-  return { query: match[1], start };
-}
-
-// `editorRef` points at a QuillEditor instance (see QuillEditor.jsx) rather
-// than a controlled string + <textarea> ref: compose/edit boxes are now
-// uncontrolled Quill instances, so the picker tracks the caret via
-// QuillEditor's onCaretChange callback and edits the mention text in place
-// through QuillEditor's getSelection()/replaceRange() instead of doing string
-// surgery on React state.
-function useMentionPicker(editorRef, mentions, setMentions) {
-  const [active, setActive] = useState(null); // { query, start } | null
-  const [results, setResults] = useState([]);
-  const [activeIndex, setActiveIndex] = useState(0);
-
-  // Re-derives the active @-query from the caret. Wired up as QuillEditor's
-  // onCaretChange prop, which calls this with the editor's current plain text
-  // and caret index (null when the editor has no active selection).
-  function syncFromCaret(nextText, caret) {
-    const found = findMentionQuery(nextText ?? '', caret);
-    setActive(found);
-    if (!found) setResults([]);
-  }
-
-  useEffect(() => {
-    if (!active) return undefined;
-    // Empty query (e.g. right after typing a bare "@") → skip the round trip;
-    // the backend returns [] for it anyway.
-    if (!active.query.trim()) { setResults([]); return undefined; }
-    let cancelled = false;
-    const timer = setTimeout(async () => {
-      try {
-        const people = await sw('cc:api:searchPeople', { q: active.query });
-        if (!cancelled) { setResults(people ?? []); setActiveIndex(0); }
-      } catch {
-        if (!cancelled) setResults([]);
-      }
-    }, MENTION_SEARCH_DEBOUNCE_MS);
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [active?.query, active?.start]);
-
-  function pick(person) {
-    if (!active) return;
-    const editor = editorRef.current;
-    if (!editor) return;
-    // mousedown (see MentionSuggestions) fires before blur, so the editor's
-    // selection is still live here.
-    const sel = editor.getSelection();
-    const caret = sel ? sel.index : active.start + active.query.length + 1;
-    const insertion = `@${person.name} `;
-    editor.replaceRange(active.start, caret, insertion);
-    setMentions((prev) => (
-      prev.some((m) => m.email === person.email) ? prev : [...prev, { email: person.email, name: person.name }]
-    ));
-    setActive(null);
-    setResults([]);
-  }
-
-  // Returns true if the key was consumed by list navigation (caller should preventDefault).
-  function handleKeyDown(e) {
-    if (!active || !results.length) return false;
-    if (e.key === 'ArrowDown') { setActiveIndex((i) => (i + 1) % results.length); return true; }
-    if (e.key === 'ArrowUp') { setActiveIndex((i) => (i - 1 + results.length) % results.length); return true; }
-    if (e.key === 'Enter' || e.key === 'Tab') { pick(results[activeIndex]); return true; }
-    if (e.key === 'Escape') { setActive(null); setResults([]); return true; }
-    return false;
-  }
-
-  function removeMention(email) {
-    setMentions((prev) => prev.filter((m) => m.email !== email));
-  }
-
-  // Closes the popover without touching picked mentions. Call on any dismiss
-  // path that bypasses handleKeyDown (mouse Send/Save, closing an editor).
-  function reset() {
-    setActive(null);
-    setResults([]);
-    setActiveIndex(0);
-  }
-
-  return {
-    results, activeIndex, setActiveIndex, syncFromCaret, handleKeyDown, pick, removeMention, reset,
-  };
-}
 
 // Positioned relative to the viewport (not the compose box) and rendered into
 // a document.body portal, so ancestor `overflow` on .cc-detail/.cc-comments
@@ -1143,7 +1237,7 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
 
   async function postReply() {
     const editor = replyEditorRef.current;
-    if (!editor || !editor.getText().trim()) return;
+    if (!editor || replyEmpty) return;
     setReplyError(null);
     // Store raw HTML; CommentBody sanitizes at render time (same as milo).
     const body = editor.getHtml();
@@ -1260,6 +1354,8 @@ function ThreadDetail({ thread, resolution, tabId, pageUrl, auth, onBack, onUpda
         >
           <QuillEditor
             ref={replyEditorRef}
+            loadQuill={loadQuill}
+            renderEmojiIcon={renderEmojiIcon}
             placeholder="Reply… (@ to mention someone)"
             aria-label="Reply text"
             onEmptyChange={setReplyEmpty}
@@ -1342,7 +1438,7 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
 
   async function saveEdit() {
     const editor = editorRef.current;
-    if (!editor || !editor.getText().trim()) return;
+    if (!editor || editEmpty) return;
     setEditError(null);
     const body = editor.getHtml();
     if (body.length > MAX_COMMENT_BODY_CHARS) { setEditError(BODY_TOO_LARGE_MSG); return; }
@@ -1432,6 +1528,8 @@ function CommentItem({ comment, canModify, isLast, onUpdate, onDelete, onError }
           >
             <QuillEditor
               ref={editorRef}
+              loadQuill={loadQuill}
+              renderEmojiIcon={renderEmojiIcon}
               initialHtml={comment.body ?? ''}
               aria-label="Edit comment text"
               onEmptyChange={setEditEmpty}
