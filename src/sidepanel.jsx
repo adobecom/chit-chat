@@ -495,13 +495,25 @@ function App() {
       },
       onThreads: (payload) => applyStreamThreads(payload, urlAtStart),
       pollMs: 10_000, // unchanged from the previous fixed poll
-      openStream: async ({ onMessage, onError }) => {
+      openStream: async ({ onMessage, onError, signal }) => {
+        const controller = new AbortController();
+        // Link the ladder's signal to our controller. This is what makes an
+        // in-flight connect cancellable: until `fetch` resolves there is no
+        // teardown function for conn.stop() to call, so without this a request
+        // that never returns headers (hung pod, buffering proxy) holds its socket
+        // for the life of the panel — one more on every reconnect.
+        if (signal) {
+          if (signal.aborted) controller.abort();
+          else signal.addEventListener('abort', () => controller.abort(), { once: true });
+        }
+
         const { token, apiBase, clientId } = await sw('cc:auth:streamToken');
         // No token → let the ladder degrade to polling rather than opening an
         // unauthenticated stream that would 401 immediately.
         if (!token) throw new Error('no token for stream');
+        // The token round trip is itself awaited, so re-check before opening.
+        if (controller.signal.aborted) throw new Error('aborted before connect');
 
-        const controller = new AbortController();
         const url = `${apiBase}${eventsPath(urlAtStart)}&clientId=${clientId}`;
         const res = await fetch(url, {
           headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
