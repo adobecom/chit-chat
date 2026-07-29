@@ -25,7 +25,7 @@ import { captureAnchor, resolveAnchor, finalizeAnchorForSave } from '@adobe/anno
 import { STATUS_COLORS } from '@adobe/annotations-core/colors';
 import { resolveMarkerPlacement, resolveShapePlacement } from '@adobe/annotations-core/marker-geometry';
 import {
-  MAX_GROUP_AVATARS, authorInitial, buildOverlayModel, groupTooltip,
+  authorInitial, buildOverlayModel, groupTooltip,
 } from '@adobe/annotations-core/overlay-model';
 
 // Markers render on the host page, not inside chit-chat's own themed side
@@ -94,18 +94,18 @@ if (window.__chitChatLoaded) {
                 font: bold 10px/1 sans-serif; color: #fff;
                 border: 2px solid #fff; box-sizing: border-box; }
       .cc-dot:hover { transform: translate(-50%,-50%) scale(1.2); }
-      /* Status ring colors (background is now per-user, set inline). Sourced
-         from @adobe/annotations-core/colors — the same S2 semantic values
-         this extension's own status badge already uses (open/notice,
-         in_progress/informative, resolved/positive), so the marker no longer
-         contradicts its own badge. */
-      .cc-dot--open        { border-color: ${OPEN_COLOR}; }
-      .cc-dot--in_progress { border-color: ${IN_PROGRESS_COLOR}; }
-      .cc-dot--resolved    { border-color: ${RESOLVED_COLOR}; }
       /* Stacked marker for co-located threads (buildOverlayModel's 'group'
          descriptor) — mirrors milo's .pc-dot-group. Positioned like .cc-dot
          (translate(-50%,-50%) off the anchor's center) so a cluster sits exactly
-         where the single dot it replaces would have. */
+         where the single dot it replaces would have.
+         ORDER IS LOAD-BEARING: both this block and .cc-dot above must stay
+         BEFORE the .cc-dot--* status modifiers. They set the border shorthand,
+         which resets border-color; at equal specificity (0,1,0) source order
+         decides, so declaring them after the modifiers silently strips the
+         status ring off every marker — a cluster of resolved threads would look
+         identical to a cluster of open ones. (Verified in Chrome both ways.)
+         NB: no backticks in this comment — the whole stylesheet is a JS
+         template literal, so a backtick here terminates the string. */
       .cc-dot-group { position: absolute; display: flex; align-items: center;
                       cursor: pointer; pointer-events: all;
                       transform: translate(-50%,-50%); }
@@ -117,6 +117,14 @@ if (window.__chitChatLoaded) {
                              box-shadow: 0 1px 4px rgba(0,0,0,.3);
                              transition: transform .12s; position: relative; }
       .cc-dot-group-avatar:not(:first-child) { margin-left: -6px; }
+      /* Status ring colors (background is per-user, set inline). Sourced from
+         @adobe/annotations-core/colors — the same S2 semantic values this
+         extension's own status badge already uses (open/notice,
+         in_progress/informative, resolved/positive), so the marker no longer
+         contradicts its own badge. Applies to single dots AND group avatars. */
+      .cc-dot--open        { border-color: ${OPEN_COLOR}; }
+      .cc-dot--in_progress { border-color: ${IN_PROGRESS_COLOR}; }
+      .cc-dot--resolved    { border-color: ${RESOLVED_COLOR}; }
       .cc-dot-group:hover .cc-dot-group-avatar { transform: scale(1.15); }
       .cc-dot-group-overflow { background: #606060 !important; font-size: 9px; }
       .cc-shape { position: absolute; pointer-events: all; cursor: pointer;
@@ -297,7 +305,17 @@ if (window.__chitChatLoaded) {
   function renderMarkers() {
     const overlay = ensureOverlay();
     overlay.innerHTML = '';
-    const markers = buildOverlayModel(_threads, { statusFilter: _statusFilter });
+    // hideOrphaned:false — this client can't CLEAR is_orphaned. milo sets the
+    // flag server-side and un-sets it from its own MutationObserver; without
+    // that half, hiding orphaned threads here would drop their markers
+    // permanently while the panel list still showed them. Render them instead
+    // and let resolveMarkerPlacement report 'unanchored', which the stylesheet
+    // already dims to 25% grayscale — an honest "this no longer resolves"
+    // signal rather than a silent disappearance.
+    const markers = buildOverlayModel(_threads, {
+      statusFilter: _statusFilter,
+      hideOrphaned: false,
+    });
     for (const marker of markers) {
       if (marker.kind === 'shape') {
         renderShapeMarker(overlay, marker.thread);

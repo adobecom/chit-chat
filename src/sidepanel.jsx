@@ -430,14 +430,54 @@ function App() {
   // fetchThreads uses doesn't transfer — a pushed frame has no "request start"
   // to compare against — so frames are suppressed for a short window after a
   // local mutation instead. See lastMutationAtRef.
+  //
+  // A suppressed frame must be RE-FETCHED, not merely dropped. The backend
+  // broadcasts only on write, and no poll is running while the stream is healthy
+  // (the realtime ladder stops it on the first frame), so a discarded frame is
+  // gone for good: if another reviewer's change happens to land inside the
+  // window, this panel would never see it for the rest of the session. The timer
+  // below re-syncs once the window closes, which restores eventual consistency.
+  const catchUpTimerRef = useRef(null);
   const applyStreamThreads = useCallback((payload, forUrl) => {
     if (forUrl !== pageUrlRef.current) return; // page changed under us
-    if (Date.now() - lastMutationAtRef.current < MUTATION_GRACE_MS) return;
+
+    const sinceMutation = Date.now() - lastMutationAtRef.current;
+    if (sinceMutation < MUTATION_GRACE_MS) {
+      // One pending catch-up is enough — collapse repeats rather than stacking
+      // a timer per suppressed frame.
+      if (catchUpTimerRef.current === null) {
+        catchUpTimerRef.current = setTimeout(() => {
+          catchUpTimerRef.current = null;
+          if (forUrl === pageUrlRef.current) {
+            catchUpRef.current?.(forUrl);
+          }
+        }, MUTATION_GRACE_MS - sinceMutation + 50);
+      }
+      return;
+    }
+
     const list = payload?.threads ?? payload ?? [];
     if (!Array.isArray(list)) return;
+    // Bump the sequence so an in-flight poll started BEFORE this frame can't
+    // land afterwards and revert it (fetchThreads compares against this).
+    mutationSeqRef.current += 1;
     threadsUrlRef.current = forUrl;
     setThreads(list);
     setSessionExpired(false); // a live frame proves the session is healthy
+  }, []);
+
+  // Indirection so applyStreamThreads (deps []) can reach the current
+  // fetchThreads without being recreated — recreating it would tear down and
+  // reopen the SSE stream on every render.
+  const catchUpRef = useRef(null);
+
+  // Keep the catch-up indirection pointing at the live fetchThreads.
+  useEffect(() => {
+    catchUpRef.current = (url) => fetchThreads(url, { silent: true, background: true });
+  }, [fetchThreads]);
+
+  useEffect(() => () => {
+    if (catchUpTimerRef.current !== null) clearTimeout(catchUpTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -446,8 +486,13 @@ function App() {
     const urlAtStart = pageUrl;
     const conn = createRealtimeConnection({
       // Keep the existing SW-proxied fetch as the fallback: it already handles
-      // token refresh, SESSION_EXPIRED and the 401 retry.
-      poll: () => fetchThreads(urlAtStart, { silent: true, background: true }),
+      // token refresh, SESSION_EXPIRED and the 401 retry. Skipped while the
+      // panel is hidden — a background poll for a panel nobody is looking at is
+      // pure API load (the pre-SSE poll had this same guard).
+      poll: () => {
+        if (document.hidden) return undefined;
+        return fetchThreads(urlAtStart, { silent: true, background: true });
+      },
       onThreads: (payload) => applyStreamThreads(payload, urlAtStart),
       pollMs: 10_000, // unchanged from the previous fixed poll
       openStream: async ({ onMessage, onError }) => {
