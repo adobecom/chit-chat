@@ -322,8 +322,17 @@ if (window.__chitChatLoaded) {
       }
       // resolveAll keys by thread id; a thread present in the model always has an
       // entry, but tolerate a missing one (a marker rendered before resolution
-      // completes) by treating it as unresolved rather than skipping the marker.
-      const res = _resolvedMap[marker.thread.id] ?? { element: null, status: 'unanchored' };
+      // completes) rather than skipping the marker.
+      //
+      // The fallback status is 'unknown', NOT 'unanchored'. thread-store's rule is
+      // that a missing verdict means UNKNOWN and must never read as unanchored —
+      // otherwise a payload arriving before this script has resolved anything would
+      // orphan every thread on the page. Restating that judgement locally with the
+      // OPPOSITE default is the shared-model-plus-local-recomputation pattern the
+      // extraction exists to remove. Cosmetic today only because this overlay never
+      // PATCHes and resolveMarkerPlacement treats every non-resolved status
+      // identically (stored boundingRect, dimmed) — so rendering is unchanged.
+      const res = _resolvedMap[marker.thread.id] ?? { element: null, status: 'unknown' };
       if (marker.kind === 'group') {
         renderGroupMarker(overlay, marker, res);
       } else {
