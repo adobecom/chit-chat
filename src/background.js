@@ -21,15 +21,24 @@ import {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-// Toggle 'stage' ↔ 'prod' to switch both the IMS host and API together.
+// Toggle 'stage' ↔ 'prod' to switch both the IMS host and API together. Keep
+// ENV = 'prod' COMMITTED — a stage flip is a local edit for testing, never a commit,
+// or a shipped build silently writes test comments against the wrong environment.
+//
+// forge{,-stage}.adobe.io and milo-core-{prod,stage}.adobe.io are two names for the
+// SAME Ethos service (byte-identical bundle per environment). We use the forge names
+// because forge-stage.adobe.io maps cleanly onto milo-logs-deploy's `stage` branch,
+// which is what makes stage verification possible. milo-core-* stays a permanent
+// alias — still accepted server-side and still in host_permissions — so reverting a
+// HOSTS entry needs no manifest change.
 const ENV = 'prod'; // 'stage' | 'prod'
 const HOSTS = {
   stage: {
-    api: 'https://milo-core-stage.adobe.io/annotations',
+    api: 'https://forge-stage.adobe.io/annotations',
     ims: 'https://ims-na1-stg1.adobelogin.com',
   },
   prod: {
-    api: 'https://milo-core-prod.adobe.io/annotations',
+    api: 'https://forge.adobe.io/annotations',
     ims: 'https://ims-na1.adobelogin.com',
   },
 };

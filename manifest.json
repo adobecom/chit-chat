@@ -8,6 +8,8 @@
 
   "permissions": ["sidePanel", "activeTab", "scripting", "storage", "tabs", "identity"],
   "host_permissions": [
+    "https://forge.adobe.io/*",
+    "https://forge-stage.adobe.io/*",
     "https://milo-core-prod.adobe.io/*",
     "https://milo-core-stage.adobe.io/*",
     "https://ims-na1.adobelogin.com/*",

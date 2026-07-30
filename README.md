@@ -8,7 +8,7 @@ Click the Chit Chat toolbar icon on any AEM / DA Live page to open the panel and
 
 - **Side panel** — threads list, thread detail, comment compose, status management, votes, export. The browser docks and resizes the panel; no custom drag/snap UI.
 - **On-page overlay** — dot markers and shape markers positioned over the live DOM; element-picker mode, rectangle/ellipse shape mode, text-selection "+Comment" button.
-- **Backend** — `https://milo-core-prod.adobe.io/annotations` (the same Milo API as the bookmarklet, same anchor format, same stored data).
+- **Backend** — `https://forge.adobe.io/annotations` (the same Milo API as the bookmarklet, same anchor format, same stored data). `milo-core-prod.adobe.io` is the same service under a permanent alias and still works; see "Environment" below.
 - **Auth** — Adobe IMS via `chrome.identity.launchWebAuthFlow` (implicit grant). The redirect URI `https://<ext-id>.chromiumapp.org/` must be registered on the IMS client for the target environment.
 
 ## Load the extension (Developer mode)
@@ -51,7 +51,9 @@ and that no unit suite could see.
 
 ## Which pages does it work on?
 
-The overlay and API both work on **any page** — the extension uses `host_permissions` for `milo-core-prod.adobe.io` so API fetches bypass CORS entirely (unlike the bookmarklet, which is gated to CORS-allowlisted origins). However, the page's Content-Security-Policy may still block the content script from running on some pages.
+The overlay and API both work on **any page** — the extension uses `host_permissions` for the API host so fetches from the service worker bypass CORS entirely (unlike the bookmarklet, which is gated to CORS-allowlisted origins). However, the page's Content-Security-Policy may still block the content script from running on some pages.
+
+`host_permissions` lists **all four** API hosts (`forge{,-stage}` and `milo-core-{prod,stage}`) so either name works without a manifest edit. A missing entry here is a hard failure, not a degraded one — the fetch is blocked outright.
 
 ## Auth handshake
 
@@ -63,7 +65,27 @@ Sign-in uses `chrome.identity.launchWebAuthFlow` — no relay page required. The
 
 **Setup:** the redirect URI `https://<ext-id>.chromiumapp.org/` must be registered on the IMS client. The extension ID is stable because the manifest includes a `key`. To find the exact redirect URI, open the service worker console and run `chrome.identity.getRedirectURL()`.
 
-**Environment (`ENV` constant in `background.js`):** `'stage'` points at `ims-na1-stg1.adobelogin.com` + `milo-core-stage.adobe.io`; `'prod'` points at the production IMS and API. Keep them in sync — a stage token is rejected by the prod API.
+**Environment (`ENV` constant in `background.js`):** `'stage'` points at
+`ims-na1-stg1.adobelogin.com` + `forge-stage.adobe.io`; `'prod'` points at
+`ims-na1.adobelogin.com` + `forge.adobe.io`. Keep them in sync — a stage token is
+rejected by the prod API, which is exactly why they live in one `HOSTS` table and flip
+together. `ENV = 'prod'` stays committed; a stage flip is a local edit only.
+
+| `ENV` | API | IMS | milo-logs-deploy branch |
+|---|---|---|---|
+| `'stage'` | `https://forge-stage.adobe.io/annotations` | `https://ims-na1-stg1.adobelogin.com` | `stage` |
+| `'prod'` | `https://forge.adobe.io/annotations` | `https://ims-na1.adobelogin.com` | `main` |
+
+The older `milo-core-{prod,stage}.adobe.io` names are the **same Ethos service** — one
+deploy, two FQDNs, byte-identical bundle per environment. They remain a permanent alias
+and stay in `host_permissions`, so swapping a `HOSTS` entry back needs no manifest change.
+The `forge` names are preferred because `forge-stage` maps cleanly onto the `stage`
+branch lane, which is what makes verifying a change on stage possible at all.
+
+⚠️ **Do not touch the manifest `key`.** It pins the extension ID to
+`nafgnogpgkcheonjkjjdfjjhnhllbkdh`, which is what keeps the `chromiumapp.org` redirect
+URI stable across the stage and prod IMS clients. Changing it breaks sign-in in a way
+that looks like an IMS outage.
 
 ## Anchor format compatibility
 

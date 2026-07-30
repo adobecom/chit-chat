@@ -113,8 +113,8 @@ S2's `style()` macro (`@react-spectrum/s2/style` with `{ type: 'macro' }`) is av
 
 ## Key Constants
 
-- `ENV = 'prod'` — controls both IMS host and API host; flip to `'stage'` for stage testing
-- `API_BASE = HOSTS[ENV].api` (prod: `https://milo-core-prod.adobe.io/annotations`)
+- `ENV = 'prod'` — controls both IMS host and API host; flip to `'stage'` for stage testing (local edit only, never committed)
+- `API_BASE = HOSTS[ENV].api` — prod `https://forge.adobe.io/annotations`, stage `https://forge-stage.adobe.io/annotations`. `milo-core-{prod,stage}.adobe.io` is the SAME Ethos service under a permanent alias and stays in `host_permissions`; the `forge` names are preferred because `forge-stage` maps cleanly onto milo-logs-deploy's `stage` branch. `host_permissions` lists all four, so swapping a `HOSTS` entry needs no manifest edit
 - `CLIENT_ID = 'milo-logs-claude-mcp'`
 - `SCOPES = 'AdobeID,openid,profile,email'`
 - Extension ID: `nafgnogpgkcheonjkjjdfjjhnhllbkdh` (pinned by manifest `key`)
